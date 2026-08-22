@@ -10,6 +10,10 @@ import requests
 
 DEX_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
 PUMP_COIN = "https://frontend-api-v3.pump.fun/coins/{mint}"
+PUMP_CURRENTLY_LIVE = (
+    "https://frontend-api-v3.pump.fun/coins/currently-live"
+    "?offset=0&limit=1000&includeNsfw=false"
+)
 PUMP_RECENT = (
     "https://frontend-api-v3.pump.fun/coins"
     "?offset=0&limit={limit}&sort={sort_by}&order=DESC&includeNsfw=false"
@@ -122,7 +126,9 @@ def _extract_int(value: Any) -> int | None:
 
 
 def _live_viewers(coin: dict[str, Any]) -> int | None:
-    """Read Pump's viewer count when present without guessing from participants."""
+    """Read the count shown in Pump's live video player for an active stream."""
+    if not bool(coin.get("is_currently_live") or coin.get("is_live")):
+        return None
     livestream = coin.get("livestream") if isinstance(coin.get("livestream"), dict) else {}
     for value in (
         coin.get("live_viewers"),
@@ -130,6 +136,7 @@ def _live_viewers(coin: dict[str, Any]) -> int | None:
         coin.get("viewers"),
         coin.get("current_viewers"),
         coin.get("livestream_viewer_count"),
+        coin.get("num_participants"),
         livestream.get("viewer_count"),
         livestream.get("viewers"),
         livestream.get("current_viewers"),
@@ -190,7 +197,26 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
         raise ScannerError(f"Recent-mint discovery failed: {exc}") from exc
     if not isinstance(coins, list):
         raise ScannerError("Pump returned an unexpected recent-mint response.")
-    return [coin for coin in coins if isinstance(coin, dict) and coin.get("mint")]
+    recent = [coin for coin in coins if isinstance(coin, dict) and coin.get("mint")]
+
+    # The normal coin feed may omit the live-player participant count. Pump's
+    # dedicated live feed includes it, so merge that small lookup once per sweep.
+    try:
+        live_coins = _get_json(PUMP_CURRENTLY_LIVE)
+        live_by_mint = {
+            coin["mint"]: coin
+            for coin in live_coins
+            if isinstance(coin, dict) and coin.get("mint")
+        } if isinstance(live_coins, list) else {}
+        for coin in recent:
+            live_coin = live_by_mint.get(coin["mint"])
+            if live_coin:
+                coin["is_currently_live"] = True
+                coin["num_participants"] = live_coin.get("num_participants")
+    except requests.RequestException:
+        pass
+
+    return recent
 
 
 def scan_token(
