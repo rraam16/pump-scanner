@@ -309,6 +309,11 @@ if discover_tab.open:
                 lambda row: live_audience_label(row.get("is_currently_live"), row.get("live_viewers")),
                 axis=1,
             )
+            live_stream_count = int(discovery_df["is_currently_live"].fillna(False).sum())
+            graduated_count = int(discovery_df["complete"].fillna(False).sum())
+            cleared_hard_rules = int(
+                discovery_df["verdict"].isin(["PASS", "HARD PASS"]).sum()
+            )
             for column in display_columns:
                 if column not in discovery_df:
                     discovery_df[column] = None
@@ -318,13 +323,13 @@ if discover_tab.open:
                 st.metric("Mints scanned", len(discovery_df), border=True)
                 st.metric(
                     "Live streams",
-                    int(discovery_df["is_currently_live"].fillna(False).sum()),
+                    live_stream_count,
                     border=True,
                 )
-                st.metric("Graduated", int(discovery_df["complete"].sum()), border=True)
+                st.metric("Graduated", graduated_count, border=True)
                 st.metric(
                     "Cleared hard rules",
-                    int((~discovery_df["verdict"].isin(["PASS", "HARD PASS"])).sum()),
+                    cleared_hard_rules,
                     border=True,
                 )
 
