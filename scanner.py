@@ -10,6 +10,10 @@ from typing import Any
 import requests
 
 DEX_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
+GECKO_DISCOVERY = (
+    "https://api.geckoterminal.com/api/v2/networks/solana/{feed}_pools"
+    "?page={page}&include=base_token"
+)
 PUMP_COIN = (
     "https://frontend-api-v3.pump.fun/coins-v3/{mint}"
     "?includeLiveStreamInfo=true"
@@ -131,6 +135,16 @@ def _age_minutes(created_ms: int | None) -> float | None:
     if not created_ms:
         return None
     return max(0.0, (datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 60_000)
+
+
+def _timestamp_ms(value: Any) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_percent(value: Any) -> float | None:
@@ -310,10 +324,98 @@ def _board_coins(payload: Any) -> list[dict[str, Any]] | None:
     return coins
 
 
+def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
+    """Translate GeckoTerminal pools into self-contained Pump scan rows."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return None
+
+    tokens: dict[str, dict[str, Any]] = {}
+    for item in payload.get("included") or []:
+        if isinstance(item, dict) and item.get("id"):
+            tokens[item["id"]] = item.get("attributes") or {}
+
+    coins: list[dict[str, Any]] = []
+    for pool in payload["data"]:
+        if not isinstance(pool, dict):
+            continue
+        relationships = pool.get("relationships") or {}
+        base_ref = ((relationships.get("base_token") or {}).get("data") or {})
+        dex_ref = ((relationships.get("dex") or {}).get("data") or {})
+        token_id = base_ref.get("id")
+        token = tokens.get(token_id, {})
+        mint = token.get("address")
+        if not mint and isinstance(token_id, str) and token_id.startswith("solana_"):
+            mint = token_id.removeprefix("solana_")
+        dex_id = str(dex_ref.get("id") or "").lower()
+        if (
+            not isinstance(mint, str)
+            or not mint.lower().endswith("pump")
+            or dex_id not in {"pump-fun", "pumpswap"}
+        ):
+            continue
+
+        attributes = pool.get("attributes") or {}
+        changes = attributes.get("price_change_percentage") or {}
+        volume = attributes.get("volume_usd") or {}
+        transactions = attributes.get("transactions") or {}
+        txns_24h = transactions.get("h24") or {}
+        pair_address = attributes.get("address")
+        coins.append({
+            "mint": mint,
+            "name": token.get("name"),
+            "symbol": token.get("symbol"),
+            "image_uri": token.get("image_url"),
+            "market_cap_usd": attributes.get("market_cap_usd") or attributes.get("fdv_usd"),
+            "liquidity_usd": attributes.get("reserve_in_usd"),
+            "created_timestamp": _timestamp_ms(attributes.get("pool_created_at")),
+            "price_change_5m": changes.get("m5"),
+            "price_change_1h": changes.get("h1"),
+            "price_change_24h": changes.get("h24"),
+            "volume_24h": volume.get("h24"),
+            "buys_24h": txns_24h.get("buys"),
+            "sells_24h": txns_24h.get("sells"),
+            "complete": dex_id == "pumpswap",
+            "pair_url": (
+                f"https://www.geckoterminal.com/solana/pools/{pair_address}"
+                if pair_address else None
+            ),
+            "_market_snapshot_complete": True,
+        })
+    return coins
+
+
+def _gecko_discovery(limit: int, sort_by: str) -> list[dict[str, Any]]:
+    """Use an independent market index when Pump blocks cloud-hosted requests."""
+    feed = "trending" if sort_by == "last_trade_timestamp" else "new"
+    coins: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page_count = min(3, (limit + 19) // 20)
+    for page in range(1, page_count + 1):
+        try:
+            payload = _get_json(GECKO_DISCOVERY.format(feed=feed, page=page))
+        except (requests.RequestException, ValueError):
+            break
+        rows = _gecko_pool_coins(payload)
+        if rows is None:
+            break
+        for coin in rows:
+            if coin["mint"] in seen:
+                continue
+            seen.add(coin["mint"])
+            coins.append(coin)
+            if len(coins) >= limit:
+                return coins
+    return coins
+
+
 def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -> list[dict[str, Any]]:
     """Return Pump launches while tolerating a blocked discovery endpoint."""
     limit = max(5, min(int(limit), 50))
     sort_by = sort_by if sort_by in {"created_timestamp", "last_trade_timestamp"} else "created_timestamp"
+    recent = _gecko_discovery(limit, sort_by)
+    if recent:
+        return recent
+
     board = "movers" if sort_by == "last_trade_timestamp" else "new"
     sources = (
         PUMP_RECENT_SEARCH.format(limit=limit, sort_by=sort_by),
@@ -321,14 +423,14 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
         PUMP_RECENT_LEGACY.format(limit=limit, sort_by=sort_by),
     )
 
-    recent: list[dict[str, Any]] | None = None
+    recent_fallback: list[dict[str, Any]] | None = None
     for url in sources:
         try:
             payload = _get_json(url)
         except (requests.RequestException, ValueError):
             continue
         if isinstance(payload, list):
-            recent = [
+            recent_fallback = [
                 dict(coin)
                 for coin in payload
                 if isinstance(coin, dict) and coin.get("mint")
@@ -336,13 +438,14 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
             break
         board_rows = _board_coins(payload)
         if board_rows is not None:
-            recent = board_rows
+            recent_fallback = board_rows
             break
 
-    if recent is None:
+    if recent_fallback is None:
         raise ScannerError(
             "Recent-mint discovery is temporarily unavailable. Try another sweep shortly."
         )
+    recent = recent_fallback
 
     # The normal coin feed may omit the live-player participant count. Pump's
     # live page uses the dedicated roster, so merge it once per discovery sweep.
@@ -394,10 +497,13 @@ def scan_token(
     else:
         coin = coin_data
 
-    try:
-        pairs = _get_json(DEX_TOKEN_PAIRS.format(mint=mint))
-    except requests.RequestException:
+    if coin.get("_market_snapshot_complete"):
         pairs = []
+    else:
+        try:
+            pairs = _get_json(DEX_TOKEN_PAIRS.format(mint=mint))
+        except requests.RequestException:
+            pairs = []
     pair = _best_pair(pairs if isinstance(pairs, list) else [])
     manual = manual or {}
 
@@ -407,24 +513,25 @@ def scan_token(
     changes = (pair or {}).get("priceChange") or {}
     volume = (pair or {}).get("volume") or {}
     liquidity = (pair or {}).get("liquidity") or {}
+    base_token = (pair or {}).get("baseToken") or {}
 
     result = ScanResult(
         mint=mint,
-        symbol=coin.get("symbol") or "Unknown",
-        name=coin.get("name") or "Unknown",
+        symbol=coin.get("symbol") or base_token.get("symbol") or "Unknown",
+        name=coin.get("name") or base_token.get("name") or "Unknown",
         market_cap_usd=_extract_percent((pair or {}).get("marketCap") or coin.get("market_cap_usd") or coin.get("usd_market_cap")),
         ath_market_cap_usd=_extract_percent(coin.get("ath_market_cap")),
-        liquidity_usd=_extract_percent(liquidity.get("usd")),
+        liquidity_usd=_extract_percent(liquidity.get("usd") or coin.get("liquidity_usd")),
         age_minutes=_age_minutes(created_ms or pair_created_ms),
         live_viewers=_live_viewers(coin),
         is_currently_live=_is_live(coin),
         reply_count=_extract_int(coin.get("reply_count")),
-        price_change_5m=_extract_percent(changes.get("m5")),
-        price_change_1h=_extract_percent(changes.get("h1")),
-        price_change_24h=_extract_percent(changes.get("h24")),
-        volume_24h=_extract_percent(volume.get("h24")),
-        buys_24h=(txns.get("h24") or {}).get("buys"),
-        sells_24h=(txns.get("h24") or {}).get("sells"),
+        price_change_5m=_extract_percent(changes.get("m5") or coin.get("price_change_5m")),
+        price_change_1h=_extract_percent(changes.get("h1") or coin.get("price_change_1h")),
+        price_change_24h=_extract_percent(changes.get("h24") or coin.get("price_change_24h")),
+        volume_24h=_extract_percent(volume.get("h24") or coin.get("volume_24h")),
+        buys_24h=(txns.get("h24") or {}).get("buys") or coin.get("buys_24h"),
+        sells_24h=(txns.get("h24") or {}).get("sells") or coin.get("sells_24h"),
         top10_percent=(
             manual.get("top10_percent")
             if manual.get("top10_percent") is not None
@@ -443,7 +550,7 @@ def scan_token(
         mayhem_mode=_mode_is_active(coin.get("mayhem_mode") or coin.get("is_mayhem_mode")),
         website=coin.get("website"),
         social=coin.get("twitter"),
-        pair_url=(pair or {}).get("url"),
+        pair_url=(pair or {}).get("url") or coin.get("pair_url"),
     )
     return evaluate(result, rules)
 
