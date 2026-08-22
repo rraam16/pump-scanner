@@ -4,7 +4,7 @@ The **Discover** tab automatically pulls the newest non-NSFW Pump.fun mints and 
 
 Use **Automatic sweep** to refresh the discovery results every 1–15 minutes. The Discover view must remain open; choose **Off** to disable scheduled API activity.
 
-The default **Aggressive** profile scans 50 actively traded mints, allows ungraduated launches, and uses a 0% five-minute / $250 volume floor. **Top movers** and **Risk-first** remain available for stronger confirmation.
+The default **Aggressive** profile scans 50 actively traded mints, allows ungraduated launches, and uses a 0% five-minute / $250 volume floor. **Live now** reads Pump's active livestream roster and ranks tokens by current participants. **Top movers** and **Risk-first** remain available for other screening styles.
 
 The quick sweep is a discovery filter, not an entry signal. Holder, sniper, bundler, and concentration data may still require a deep scan or independent verification.
 

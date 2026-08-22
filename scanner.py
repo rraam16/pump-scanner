@@ -10,7 +10,10 @@ from typing import Any
 import requests
 
 DEX_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
-PUMP_COIN = "https://frontend-api-v3.pump.fun/coins/{mint}"
+PUMP_COIN = (
+    "https://frontend-api-v3.pump.fun/coins-v3/{mint}"
+    "?includeLiveStreamInfo=true"
+)
 PUMP_LIVE_SEARCH = (
     "https://frontend-api-v3.pump.fun/coins/search-unrestricted"
     "?limit=100&offset=0&includeNsfw=false&order=desc"
@@ -21,9 +24,17 @@ PUMP_CURRENTLY_LIVE = (
     "?offset=0&limit=1000&includeNsfw=false"
 )
 PUMP_LIVESTREAM = "https://livestream-api.pump.fun/livestream?mintId={mint}"
-PUMP_RECENT = (
+PUMP_RECENT_SEARCH = (
+    "https://frontend-api-v3.pump.fun/coins/search-unrestricted"
+    "?offset=0&limit={limit}&sort={sort_by}&order=desc&includeNsfw=false"
+)
+PUMP_RECENT_LEGACY = (
     "https://frontend-api-v3.pump.fun/coins"
     "?offset=0&limit={limit}&sort={sort_by}&order=DESC&includeNsfw=false"
+)
+PUMP_DISCOVERY_BOARD = (
+    "https://advanced-indexer.pump.fun/boards/{board}"
+    "?tier=web&surface=WEB&platform=WEB&limit={limit}"
 )
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -177,18 +188,27 @@ def _live_roster() -> dict[str, dict[str, Any]]:
     if _LIVE_ROSTER_CACHE and now - _LIVE_ROSTER_CACHED_AT < _LIVE_ROSTER_TTL_SECONDS:
         return _LIVE_ROSTER_CACHE
 
-    for url in (PUMP_LIVE_SEARCH, PUMP_CURRENTLY_LIVE):
+    roster: dict[str, dict[str, Any]] = {}
+    successful_lookup = False
+
+    # The broad roster currently contains more live rooms. Pump's sorted live
+    # search is fetched second so its displayed participant count wins when a
+    # mint appears in both responses.
+    for url in (PUMP_CURRENTLY_LIVE, PUMP_LIVE_SEARCH):
         try:
             payload = _get_json(url)
         except (requests.RequestException, ValueError):
             continue
         if not isinstance(payload, list):
             continue
-        roster = {
+        successful_lookup = True
+        roster.update({
             coin["mint"]: coin
             for coin in payload
             if isinstance(coin, dict) and coin.get("mint") and _is_live(coin)
-        }
+        })
+
+    if successful_lookup:
         _LIVE_ROSTER_CACHE = roster
         _LIVE_ROSTER_CACHED_AT = now
         return roster
@@ -257,17 +277,72 @@ def _top10_percent(mint: str) -> float | None:
         return None
 
 
+def _board_coins(payload: Any) -> list[dict[str, Any]] | None:
+    """Translate Pump's compact discovery-board response to the coin shape."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        return None
+
+    server_ms = _extract_int(payload.get("serverTs"))
+    coins: list[dict[str, Any]] = []
+    for entry in payload["entries"]:
+        if not isinstance(entry, dict) or not entry.get("m"):
+            continue
+        age_seconds = _extract_int(entry.get("age"))
+        created_ms = (
+            server_ms - max(0, age_seconds) * 1000
+            if server_ms is not None and age_seconds is not None
+            else None
+        )
+        coins.append({
+            "mint": entry["m"],
+            "name": entry.get("n"),
+            "symbol": entry.get("t"),
+            "image_uri": entry.get("i"),
+            "description": entry.get("desc"),
+            "usd_market_cap": entry.get("mc"),
+            "ath_market_cap": entry.get("ath"),
+            "created_timestamp": created_ms,
+            "complete": bool(_extract_int(entry.get("gd"))),
+            "is_currently_live": bool(entry.get("lv")),
+            "num_participants": _extract_int(entry.get("np")),
+            "mayhem_mode": bool(entry.get("mh")),
+        })
+    return coins
+
+
 def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -> list[dict[str, Any]]:
-    """Return active non-NSFW Pump.fun launches from the public feed."""
+    """Return Pump launches while tolerating a blocked discovery endpoint."""
     limit = max(5, min(int(limit), 50))
     sort_by = sort_by if sort_by in {"created_timestamp", "last_trade_timestamp"} else "created_timestamp"
-    try:
-        coins = _get_json(PUMP_RECENT.format(limit=limit, sort_by=sort_by))
-    except requests.RequestException as exc:
-        raise ScannerError(f"Recent-mint discovery failed: {exc}") from exc
-    if not isinstance(coins, list):
-        raise ScannerError("Pump returned an unexpected recent-mint response.")
-    recent = [coin for coin in coins if isinstance(coin, dict) and coin.get("mint")]
+    board = "movers" if sort_by == "last_trade_timestamp" else "new"
+    sources = (
+        PUMP_RECENT_SEARCH.format(limit=limit, sort_by=sort_by),
+        PUMP_DISCOVERY_BOARD.format(board=board, limit=limit),
+        PUMP_RECENT_LEGACY.format(limit=limit, sort_by=sort_by),
+    )
+
+    recent: list[dict[str, Any]] | None = None
+    for url in sources:
+        try:
+            payload = _get_json(url)
+        except (requests.RequestException, ValueError):
+            continue
+        if isinstance(payload, list):
+            recent = [
+                dict(coin)
+                for coin in payload
+                if isinstance(coin, dict) and coin.get("mint")
+            ]
+            break
+        board_rows = _board_coins(payload)
+        if board_rows is not None:
+            recent = board_rows
+            break
+
+    if recent is None:
+        raise ScannerError(
+            "Recent-mint discovery is temporarily unavailable. Try another sweep shortly."
+        )
 
     # The normal coin feed may omit the live-player participant count. Pump's
     # live page uses the dedicated roster, so merge it once per discovery sweep.
@@ -279,6 +354,21 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
             coin["num_participants"] = live_coin.get("num_participants")
 
     return recent
+
+
+def discover_live_mints(limit: int = 20) -> list[dict[str, Any]]:
+    """Return active Pump livestreams ranked by current participants."""
+    limit = max(5, min(int(limit), 50))
+    live = list(_live_roster().values())
+    if not live:
+        raise ScannerError("Live-stream discovery is temporarily unavailable.")
+    live.sort(
+        key=lambda coin: _extract_int(
+            coin.get("num_participants") or coin.get("numParticipants")
+        ) or 0,
+        reverse=True,
+    )
+    return [dict(coin) for coin in live[:limit]]
 
 
 def scan_token(

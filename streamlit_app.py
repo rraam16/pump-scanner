@@ -9,7 +9,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from scanner import Rules, ScanResult, ScannerError, discover_recent_mints, scan_token
+from scanner import (
+    Rules,
+    ScanResult,
+    ScannerError,
+    discover_live_mints,
+    discover_recent_mints,
+    scan_token,
+)
 
 st.set_page_config(page_title="Pump Scanner", page_icon=":material/radar:", layout="wide")
 
@@ -55,6 +62,11 @@ def cached_scan(mint: str, rules_payload: dict, manual_payload: dict) -> dict:
 @st.cache_data(ttl="20s", max_entries=10, show_spinner=False)
 def cached_recent_mints(limit: int, sort_by: str) -> list[dict]:
     return discover_recent_mints(limit, sort_by)
+
+
+@st.cache_data(ttl="10s", max_entries=5, show_spinner=False)
+def cached_live_mints(limit: int) -> list[dict]:
+    return discover_live_mints(limit)
 
 
 @st.cache_data(ttl="30s", max_entries=150, show_spinner=False)
@@ -173,17 +185,17 @@ discover_tab, scan_tab, watch_tab, positions_tab = st.tabs(
 
 if discover_tab.open:
     with discover_tab:
-        st.markdown("## Fresh mint discovery")
+        st.markdown("## Token discovery")
         st.caption(
-            "Pulls the newest non-NSFW launches automatically. The quick pass avoids slow holder RPC calls; "
+            "Scan fresh launches, top movers, or active Pump livestreams. The quick pass avoids slow holder RPC calls; "
             "run a deep scan before treating any candidate as entry-eligible."
         )
         scan_profile = st.segmented_control(
             "Ranking profile",
-            ["Aggressive", "Top movers", "Risk-first"],
+            ["Aggressive", "Top movers", "Live now", "Risk-first"],
             default="Aggressive",
-            key="scan_profile_v2",
-            help="Aggressive casts the widest early-launch net. Top movers requires stronger confirmation. Risk-first prioritizes safety rules.",
+            key="scan_profile_v3",
+            help="Live now reads Pump's active livestream roster and ranks it by current participants.",
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             discovery_limit = st.select_slider(
@@ -232,15 +244,25 @@ if discover_tab.open:
                 "Aggressive discovery includes thin, ungraduated and weakly confirmed launches. "
                 "Treat the mover rank as an attention signal—not an entry signal."
             )
+        elif scan_profile == "Live now":
+            st.info(
+                "Live now scans Pump's active livestream roster and shows its current participant count. "
+                "Counts change quickly; recorded-video views are not included."
+            )
+        else:
+            st.caption("Viewer counts appear only when a token has an active Pump livestream. Choose Live now to scan those rooms directly.")
 
         try:
-            with st.spinner("Scanning the newest launches..."):
-                feed_sort = (
-                    "last_trade_timestamp"
-                    if scan_profile in {"Aggressive", "Top movers"}
-                    else "created_timestamp"
-                )
-                coins = cached_recent_mints(discovery_limit, feed_sort)
+            with st.spinner("Scanning Pump tokens..."):
+                if scan_profile == "Live now":
+                    coins = cached_live_mints(discovery_limit)
+                else:
+                    feed_sort = (
+                        "last_trade_timestamp"
+                        if scan_profile in {"Aggressive", "Top movers"}
+                        else "created_timestamp"
+                    )
+                    coins = cached_recent_mints(discovery_limit, feed_sort)
                 if graduated_only:
                     coins = [coin for coin in coins if coin.get("complete")]
                 discovery_rows = [cached_quick_scan(coin, rules.__dict__) for coin in coins]
@@ -263,6 +285,11 @@ if discover_tab.open:
                 discovery_df = discovery_df.sort_values(
                     ["mover_score", "score"], ascending=[False, False], na_position="last"
                 )
+            elif scan_profile == "Live now":
+                discovery_df["mover_score"] = None
+                discovery_df = discovery_df.sort_values(
+                    ["live_viewers", "score"], ascending=[False, False], na_position="last"
+                )
             else:
                 discovery_df["mover_score"] = None
                 discovery_df = discovery_df.sort_values(
@@ -271,8 +298,9 @@ if discover_tab.open:
             if discovery_df.empty:
                 st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
+            rank_columns = ["mover_score"] if scan_profile in {"Aggressive", "Top movers"} else []
             display_columns = [
-                "symbol", "verdict", "mover_score", "score", "market_cap_usd", "liquidity_usd",
+                "symbol", "verdict", *rank_columns, "score", "market_cap_usd", "liquidity_usd",
                 "price_change_5m", "price_change_1h", "volume_24h", "age", "live_audience",
                 "complete", "mint",
             ]
@@ -288,6 +316,11 @@ if discover_tab.open:
 
             with st.container(horizontal=True):
                 st.metric("Mints scanned", len(discovery_df), border=True)
+                st.metric(
+                    "Live streams",
+                    int(discovery_df["is_currently_live"].fillna(False).sum()),
+                    border=True,
+                )
                 st.metric("Graduated", int(discovery_df["complete"].sum()), border=True)
                 st.metric(
                     "Cleared hard rules",
