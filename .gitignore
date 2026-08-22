@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+data/*.json
+launch.ps1
+.streamlit/secrets.toml
+
