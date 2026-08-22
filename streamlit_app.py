@@ -107,6 +107,16 @@ def percent(value: float | None) -> str:
     return "—" if value is None else f"{value:+.1f}%"
 
 
+def age_label(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value < 60:
+        return f"{value:.0f}m"
+    if value < 1_440:
+        return f"{int(value // 60)}h {int(value % 60)}m"
+    return f"{int(value // 1_440)}d {int((value % 1_440) // 60)}h"
+
+
 def verdict_badge(verdict: str) -> str:
     colors = {
         "ENTRY ELIGIBLE": "green",
@@ -254,9 +264,10 @@ if discover_tab.open:
                 st.stop()
             display_columns = [
                 "symbol", "verdict", "mover_score", "score", "market_cap_usd", "liquidity_usd",
-                "price_change_5m", "price_change_1h", "volume_24h", "age_minutes",
-                "complete", "mint",
+                "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
+                "is_currently_live", "complete", "mint",
             ]
+            discovery_df["age"] = discovery_df["age_minutes"].map(age_label)
             for column in display_columns:
                 if column not in discovery_df:
                     discovery_df[column] = None
@@ -285,7 +296,13 @@ if discover_tab.open:
                     "price_change_5m": st.column_config.NumberColumn("5m", format="%+.1f%%"),
                     "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
                     "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
-                    "age_minutes": st.column_config.NumberColumn("Age (min)", format="%.0f"),
+                    "age": st.column_config.TextColumn("Token age"),
+                    "live_viewers": st.column_config.NumberColumn(
+                        "Live viewers",
+                        format="%d",
+                        help="Current Pump.fun livestream viewers when Pump exposes the count; blank means unavailable, not zero.",
+                    ),
+                    "is_currently_live": st.column_config.CheckboxColumn("Live now"),
                     "complete": st.column_config.CheckboxColumn("Graduated"),
                     "mint": st.column_config.TextColumn("Mint"),
                 },
@@ -355,7 +372,14 @@ if scan_tab.open:
                 st.metric("Market cap", money(result.market_cap_usd), border=True)
                 st.metric("Liquidity", money(result.liquidity_usd), border=True)
                 st.metric("5-minute move", percent(result.price_change_5m), border=True)
-                st.metric("Age", "—" if result.age_minutes is None else f"{result.age_minutes:.0f}m", border=True)
+                st.metric("Token age", age_label(result.age_minutes), border=True)
+                st.metric(
+                    "Live viewers",
+                    "—" if result.live_viewers is None else f"{result.live_viewers:,}",
+                    delta="LIVE" if result.is_currently_live else None,
+                    border=True,
+                    help="Pump.fun livestream viewers when available. A dash means Pump did not expose a count.",
+                )
             if result.reasons:
                 st.markdown("**Decision signals**")
                 for reason in result.reasons:
@@ -394,8 +418,10 @@ if watch_tab.open:
         watch_df = pd.DataFrame(rows)
         display_columns = [
             "symbol", "verdict", "score", "market_cap_usd", "liquidity_usd",
-            "price_change_5m", "price_change_1h", "volume_24h", "age_minutes", "mint",
+            "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
+            "is_currently_live", "mint",
         ]
+        watch_df["age"] = watch_df["age_minutes"].map(age_label)
         for column in display_columns:
             if column not in watch_df:
                 watch_df[column] = None
@@ -412,7 +438,9 @@ if watch_tab.open:
                 "price_change_5m": st.column_config.NumberColumn("5m", format="%+.1f%%"),
                 "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
                 "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
-                "age_minutes": st.column_config.NumberColumn("Age (min)", format="%.0f"),
+                "age": st.column_config.TextColumn("Token age"),
+                "live_viewers": st.column_config.NumberColumn("Live viewers", format="%d"),
+                "is_currently_live": st.column_config.CheckboxColumn("Live now"),
                 "mint": st.column_config.TextColumn("Mint"),
             },
         )

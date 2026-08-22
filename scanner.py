@@ -43,6 +43,9 @@ class ScanResult:
     ath_market_cap_usd: float | None = None
     liquidity_usd: float | None = None
     age_minutes: float | None = None
+    live_viewers: int | None = None
+    is_currently_live: bool = False
+    reply_count: int | None = None
     price_change_5m: float | None = None
     price_change_1h: float | None = None
     price_change_24h: float | None = None
@@ -109,6 +112,32 @@ def _extract_percent(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_viewers(coin: dict[str, Any]) -> int | None:
+    """Read Pump's viewer count when present without guessing from participants."""
+    livestream = coin.get("livestream") if isinstance(coin.get("livestream"), dict) else {}
+    for value in (
+        coin.get("live_viewers"),
+        coin.get("viewer_count"),
+        coin.get("viewers"),
+        coin.get("current_viewers"),
+        coin.get("livestream_viewer_count"),
+        livestream.get("viewer_count"),
+        livestream.get("viewers"),
+        livestream.get("current_viewers"),
+    ):
+        parsed = _extract_int(value)
+        if parsed is not None:
+            return max(0, parsed)
+    return None
 
 
 def _mode_is_active(value: Any) -> bool:
@@ -208,6 +237,9 @@ def scan_token(
         ath_market_cap_usd=_extract_percent(coin.get("ath_market_cap")),
         liquidity_usd=_extract_percent(liquidity.get("usd")),
         age_minutes=_age_minutes(created_ms or pair_created_ms),
+        live_viewers=_live_viewers(coin),
+        is_currently_live=bool(coin.get("is_currently_live") or coin.get("is_live")),
+        reply_count=_extract_int(coin.get("reply_count")),
         price_change_5m=_extract_percent(changes.get("m5")),
         price_change_1h=_extract_percent(changes.get("h1")),
         price_change_24h=_extract_percent(changes.get("h24")),
