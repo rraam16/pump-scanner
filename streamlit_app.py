@@ -117,6 +117,15 @@ def age_label(value: float | None) -> str:
     return f"{int(value // 1_440)}d {int((value % 1_440) // 60)}h"
 
 
+def live_audience_label(is_live: object, viewers: object) -> str:
+    """Keep live participants distinct from Pump's recorded-video view totals."""
+    if is_live is None or pd.isna(is_live) or not bool(is_live):
+        return "Not live"
+    if viewers is None or pd.isna(viewers):
+        return "Live · count unavailable"
+    return f"{int(viewers):,} live"
+
+
 def verdict_badge(verdict: str) -> str:
     colors = {
         "ENTRY ELIGIBLE": "green",
@@ -264,10 +273,14 @@ if discover_tab.open:
                 st.stop()
             display_columns = [
                 "symbol", "verdict", "mover_score", "score", "market_cap_usd", "liquidity_usd",
-                "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
-                "is_currently_live", "complete", "mint",
+                "price_change_5m", "price_change_1h", "volume_24h", "age", "live_audience",
+                "complete", "mint",
             ]
             discovery_df["age"] = discovery_df["age_minutes"].map(age_label)
+            discovery_df["live_audience"] = discovery_df.apply(
+                lambda row: live_audience_label(row.get("is_currently_live"), row.get("live_viewers")),
+                axis=1,
+            )
             for column in display_columns:
                 if column not in discovery_df:
                     discovery_df[column] = None
@@ -297,12 +310,10 @@ if discover_tab.open:
                     "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
                     "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
                     "age": st.column_config.TextColumn("Token age"),
-                    "live_viewers": st.column_config.NumberColumn(
-                        "Live viewers",
-                        format="%d",
-                        help="Current Pump.fun livestream viewers when Pump exposes the count; blank means unavailable, not zero.",
+                    "live_audience": st.column_config.TextColumn(
+                        "Live audience",
+                        help="Current Pump.fun livestream participants. Recorded-video views are a different metric.",
                     ),
-                    "is_currently_live": st.column_config.CheckboxColumn("Live now"),
                     "complete": st.column_config.CheckboxColumn("Graduated"),
                     "mint": st.column_config.TextColumn("Mint"),
                 },
@@ -374,11 +385,11 @@ if scan_tab.open:
                 st.metric("5-minute move", percent(result.price_change_5m), border=True)
                 st.metric("Token age", age_label(result.age_minutes), border=True)
                 st.metric(
-                    "Live viewers",
-                    "—" if result.live_viewers is None else f"{result.live_viewers:,}",
+                    "Live audience",
+                    live_audience_label(result.is_currently_live, result.live_viewers),
                     delta="LIVE" if result.is_currently_live else None,
                     border=True,
-                    help="Pump.fun livestream viewers when available. A dash means Pump did not expose a count.",
+                    help="Current Pump.fun livestream participants. 'Not live' means there is no active stream; recorded-video views are not counted here.",
                 )
             if result.reasons:
                 st.markdown("**Decision signals**")
@@ -418,10 +429,14 @@ if watch_tab.open:
         watch_df = pd.DataFrame(rows)
         display_columns = [
             "symbol", "verdict", "score", "market_cap_usd", "liquidity_usd",
-            "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
-            "is_currently_live", "mint",
+            "price_change_5m", "price_change_1h", "volume_24h", "age", "live_audience",
+            "mint",
         ]
         watch_df["age"] = watch_df["age_minutes"].map(age_label)
+        watch_df["live_audience"] = watch_df.apply(
+            lambda row: live_audience_label(row.get("is_currently_live"), row.get("live_viewers")),
+            axis=1,
+        )
         for column in display_columns:
             if column not in watch_df:
                 watch_df[column] = None
@@ -439,8 +454,10 @@ if watch_tab.open:
                 "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
                 "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
                 "age": st.column_config.TextColumn("Token age"),
-                "live_viewers": st.column_config.NumberColumn("Live viewers", format="%d"),
-                "is_currently_live": st.column_config.CheckboxColumn("Live now"),
+                "live_audience": st.column_config.TextColumn(
+                    "Live audience",
+                    help="Current Pump.fun livestream participants; recorded-video views are separate.",
+                ),
                 "mint": st.column_config.TextColumn("Mint"),
             },
         )

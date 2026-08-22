@@ -27,6 +27,7 @@ The app opens at `http://localhost:8502`.
 ## What it does
 
 - Screens a Solana mint using Pump metadata, DEX Screener market data, and Solana RPC.
+- Shows token age and the current Pump livestream audience. Historical video views are kept separate and are not reported as live viewers.
 - Applies configurable age, liquidity, concentration, creator, bundler, and momentum limits.
 - Maintains a watchlist and ranks candidates.
 - Tracks positions entered by the user.

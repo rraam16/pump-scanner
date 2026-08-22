@@ -4,21 +4,32 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import time
 from typing import Any
 
 import requests
 
 DEX_TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
 PUMP_COIN = "https://frontend-api-v3.pump.fun/coins/{mint}"
+PUMP_LIVE_SEARCH = (
+    "https://frontend-api-v3.pump.fun/coins/search-unrestricted"
+    "?limit=100&offset=0&includeNsfw=false&order=desc"
+    "&currentlyLive=true&sort=livestream_num_participants"
+)
 PUMP_CURRENTLY_LIVE = (
     "https://frontend-api-v3.pump.fun/coins/currently-live"
     "?offset=0&limit=1000&includeNsfw=false"
 )
+PUMP_LIVESTREAM = "https://livestream-api.pump.fun/livestream?mintId={mint}"
 PUMP_RECENT = (
     "https://frontend-api-v3.pump.fun/coins"
     "?offset=0&limit={limit}&sort={sort_by}&order=DESC&includeNsfw=false"
 )
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
+_LIVE_ROSTER_CACHE: dict[str, dict[str, Any]] = {}
+_LIVE_ROSTER_CACHED_AT = 0.0
+_LIVE_ROSTER_TTL_SECONDS = 15.0
 
 
 @dataclass
@@ -127,7 +138,7 @@ def _extract_int(value: Any) -> int | None:
 
 def _live_viewers(coin: dict[str, Any]) -> int | None:
     """Read the count shown in Pump's live video player for an active stream."""
-    if not bool(coin.get("is_currently_live") or coin.get("is_live")):
+    if not _is_live(coin):
         return None
     livestream = coin.get("livestream") if isinstance(coin.get("livestream"), dict) else {}
     for value in (
@@ -137,14 +148,73 @@ def _live_viewers(coin: dict[str, Any]) -> int | None:
         coin.get("current_viewers"),
         coin.get("livestream_viewer_count"),
         coin.get("num_participants"),
+        coin.get("numParticipants"),
         livestream.get("viewer_count"),
         livestream.get("viewers"),
         livestream.get("current_viewers"),
+        livestream.get("num_participants"),
+        livestream.get("numParticipants"),
     ):
         parsed = _extract_int(value)
         if parsed is not None:
             return max(0, parsed)
     return None
+
+
+def _is_live(coin: dict[str, Any]) -> bool:
+    return bool(
+        coin.get("is_currently_live")
+        or coin.get("is_live")
+        or coin.get("isLive")
+    )
+
+
+def _live_roster() -> dict[str, dict[str, Any]]:
+    """Return Pump's active livestream roster, briefly cached across scans."""
+    global _LIVE_ROSTER_CACHE, _LIVE_ROSTER_CACHED_AT
+
+    now = time.monotonic()
+    if _LIVE_ROSTER_CACHE and now - _LIVE_ROSTER_CACHED_AT < _LIVE_ROSTER_TTL_SECONDS:
+        return _LIVE_ROSTER_CACHE
+
+    for url in (PUMP_LIVE_SEARCH, PUMP_CURRENTLY_LIVE):
+        try:
+            payload = _get_json(url)
+        except (requests.RequestException, ValueError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        roster = {
+            coin["mint"]: coin
+            for coin in payload
+            if isinstance(coin, dict) and coin.get("mint") and _is_live(coin)
+        }
+        _LIVE_ROSTER_CACHE = roster
+        _LIVE_ROSTER_CACHED_AT = now
+        return roster
+
+    return _LIVE_ROSTER_CACHE
+
+
+def _merge_live_status(coin: dict[str, Any], mint: str) -> dict[str, Any]:
+    """Enrich a single coin with the same live count used by Pump's live page."""
+    merged = dict(coin)
+    live_coin = _live_roster().get(mint)
+    if live_coin:
+        merged["is_currently_live"] = True
+        merged["num_participants"] = live_coin.get("num_participants")
+        return merged
+
+    # Pump's per-mint service is useful when a just-started stream has not yet
+    # appeared in the roster. It uses camelCase and may return an empty body.
+    try:
+        livestream = _get_json(PUMP_LIVESTREAM.format(mint=mint))
+    except (requests.RequestException, ValueError):
+        livestream = None
+    if isinstance(livestream, dict) and _is_live(livestream):
+        merged["is_currently_live"] = True
+        merged["num_participants"] = livestream.get("numParticipants")
+    return merged
 
 
 def _mode_is_active(value: Any) -> bool:
@@ -200,21 +270,13 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
     recent = [coin for coin in coins if isinstance(coin, dict) and coin.get("mint")]
 
     # The normal coin feed may omit the live-player participant count. Pump's
-    # dedicated live feed includes it, so merge that small lookup once per sweep.
-    try:
-        live_coins = _get_json(PUMP_CURRENTLY_LIVE)
-        live_by_mint = {
-            coin["mint"]: coin
-            for coin in live_coins
-            if isinstance(coin, dict) and coin.get("mint")
-        } if isinstance(live_coins, list) else {}
-        for coin in recent:
-            live_coin = live_by_mint.get(coin["mint"])
-            if live_coin:
-                coin["is_currently_live"] = True
-                coin["num_participants"] = live_coin.get("num_participants")
-    except requests.RequestException:
-        pass
+    # live page uses the dedicated roster, so merge it once per discovery sweep.
+    live_by_mint = _live_roster()
+    for coin in recent:
+        live_coin = live_by_mint.get(coin["mint"])
+        if live_coin:
+            coin["is_currently_live"] = True
+            coin["num_participants"] = live_coin.get("num_participants")
 
     return recent
 
@@ -238,6 +300,7 @@ def scan_token(
             coin = _get_json(PUMP_COIN.format(mint=mint))
         except requests.RequestException as exc:
             raise ScannerError(f"Pump coin lookup failed: {exc}") from exc
+        coin = _merge_live_status(coin, mint)
     else:
         coin = coin_data
 
@@ -264,7 +327,7 @@ def scan_token(
         liquidity_usd=_extract_percent(liquidity.get("usd")),
         age_minutes=_age_minutes(created_ms or pair_created_ms),
         live_viewers=_live_viewers(coin),
-        is_currently_live=bool(coin.get("is_currently_live") or coin.get("is_live")),
+        is_currently_live=_is_live(coin),
         reply_count=_extract_int(coin.get("reply_count")),
         price_change_5m=_extract_percent(changes.get("m5")),
         price_change_1h=_extract_percent(changes.get("h1")),
