@@ -930,7 +930,11 @@ def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
     return coins
 
 
-def _gecko_discovery(limit: int, sort_by: str) -> list[dict[str, Any]]:
+def _gecko_discovery(
+    limit: int,
+    sort_by: str,
+    trending_duration: str | None = None,
+) -> list[dict[str, Any]]:
     """Use an independent market index when Pump blocks cloud-hosted requests."""
     feed = "trending" if sort_by == "last_trade_timestamp" else "new"
     coins: list[dict[str, Any]] = []
@@ -938,7 +942,10 @@ def _gecko_discovery(limit: int, sort_by: str) -> list[dict[str, Any]]:
     page_count = min(3, (limit + 19) // 20)
     for page in range(1, page_count + 1):
         try:
-            payload = _get_json(GECKO_DISCOVERY.format(feed=feed, page=page))
+            url = GECKO_DISCOVERY.format(feed=feed, page=page)
+            if feed == "trending" and trending_duration in {"5m", "1h", "6h", "24h"}:
+                url = f"{url}&duration={trending_duration}"
+            payload = _get_json(url)
         except (requests.RequestException, ValueError):
             break
         rows = _gecko_pool_coins(payload)
@@ -952,6 +959,17 @@ def _gecko_discovery(limit: int, sort_by: str) -> list[dict[str, Any]]:
             if len(coins) >= limit:
                 return coins
     return coins
+
+
+def discover_top_movers(limit: int = 20) -> list[dict[str, Any]]:
+    """Return Pump tokens from GeckoTerminal's five-minute trending roster."""
+    limit = max(5, min(int(limit), 50))
+    recent = _gecko_discovery(limit, "last_trade_timestamp", trending_duration="5m")
+    if not recent:
+        raise ScannerError(
+            "The five-minute Top-mover feed is temporarily unavailable. Try another sweep shortly."
+        )
+    return _enrich_pump_holder_counts(_enrich_pump_viewer_counts(recent))
 
 
 def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -> list[dict[str, Any]]:

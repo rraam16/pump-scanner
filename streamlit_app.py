@@ -18,6 +18,7 @@ from scanner import (
     analyze_bot_trades,
     discover_live_mints,
     discover_recent_mints,
+    discover_top_movers,
     scan_token,
 )
 
@@ -66,6 +67,11 @@ def cached_scan(mint: str, rules_payload: dict, manual_payload: dict) -> dict:
 @st.cache_data(ttl="20s", max_entries=10, show_spinner=False)
 def cached_recent_mints(limit: int, sort_by: str) -> list[dict]:
     return discover_recent_mints(limit, sort_by)
+
+
+@st.cache_data(ttl="30s", max_entries=5, show_spinner=False)
+def cached_top_movers(limit: int) -> list[dict]:
+    return discover_top_movers(limit)
 
 
 @st.cache_data(ttl="10s", max_entries=5, show_spinner=False)
@@ -322,6 +328,49 @@ def early_runner_metrics(row: dict[str, object], settings: dict[str, float]) -> 
     }
 
 
+def top_mover_metrics(row: dict[str, object]) -> dict[str, object]:
+    """Rank current dollar flow and participation ahead of price momentum."""
+    move_5m = numeric_value(row.get("price_change_5m"))
+    volume_5m = numeric_value(row.get("volume_5m"))
+    volume_1h = numeric_value(row.get("volume_1h"))
+    buys_5m = numeric_value(row.get("buys_5m"))
+    sells_5m = numeric_value(row.get("sells_5m"))
+    required = (move_5m, volume_5m, volume_1h, buys_5m, sells_5m)
+    if (
+        any(value is None for value in required)
+        or volume_5m < 0
+        or volume_1h < 0
+        or buys_5m < 0
+        or sells_5m < 0
+    ):
+        return {
+            "mover_score": None,
+            "trades_5m": None,
+            "trades_per_minute": None,
+            "average_trade_usd": None,
+        }
+
+    trades_5m = buys_5m + sells_5m
+    recent_volume_fit = min(1.0, math.log1p(volume_5m) / math.log1p(250_000.0))
+    hourly_volume_fit = min(1.0, math.log1p(volume_1h) / math.log1p(1_000_000.0))
+    activity_fit = min(1.0, math.log1p(trades_5m) / math.log1p(1_000.0))
+    momentum_fit = max(0.0, min(1.0, (move_5m + 10.0) / 110.0))
+    score = (
+        45.0 * recent_volume_fit
+        + 20.0 * hourly_volume_fit
+        + 25.0 * activity_fit
+        + 10.0 * momentum_fit
+    )
+    return {
+        "mover_score": round(max(0.0, min(100.0, score)), 1),
+        "trades_5m": int(trades_5m),
+        "trades_per_minute": round(trades_5m / 5.0, 1),
+        "average_trade_usd": (
+            round(volume_5m / trades_5m, 2) if trades_5m > 0 else None
+        ),
+    }
+
+
 def bot_trade_metrics(
     row: dict[str, object],
     settings: dict[str, float],
@@ -564,6 +613,12 @@ if discover_tab.open:
             "minimum_top_wallet_share": 50.0,
             "raw_shortlist_limit": 10.0,
         }
+        top_mover_settings = {
+            "minimum_momentum": 0.0,
+            "minimum_volume_5m": 1_000.0,
+            "minimum_volume_1h": 10_000.0,
+            "minimum_trades_5m": 10.0,
+        }
         with st.container(horizontal=True, vertical_alignment="bottom"):
             discovery_limit = st.select_slider(
                 "Mints per sweep",
@@ -594,13 +649,12 @@ if discover_tab.open:
                 key=f"auto_scan_label_{scan_profile.lower().replace(' ', '_')}_v3",
                 help="Runs while the Discover view remains open.",
             )
-            if scan_profile in {"Aggressive", "Top movers"}:
-                aggressive = scan_profile == "Aggressive"
+            if scan_profile == "Aggressive":
                 minimum_momentum = st.number_input(
                     "Minimum 5m move (%)",
                     -50.0,
                     500.0,
-                    0.0 if aggressive else 3.0,
+                    0.0,
                     1.0,
                     key=f"minimum_momentum_{scan_profile}",
                 )
@@ -608,7 +662,7 @@ if discover_tab.open:
                     "Minimum 24h volume ($)",
                     0.0,
                     10_000_000.0,
-                    250.0 if aggressive else 1_000.0,
+                    250.0,
                     250.0,
                     key=f"minimum_volume_{scan_profile}",
                 )
@@ -621,6 +675,54 @@ if discover_tab.open:
                 st.session_state.last_auto_scan_at_by_profile = timestamps
                 st.cache_data.clear()
                 st.rerun()
+
+        if scan_profile == "Top movers":
+            with st.expander("Top-mover activity filters", expanded=True):
+                mover_cols = st.columns(4)
+                with mover_cols[0]:
+                    top_minimum_momentum = st.number_input(
+                        "Minimum 5m move (%)",
+                        -50.0,
+                        500.0,
+                        0.0,
+                        1.0,
+                        key="top_minimum_momentum_v1",
+                    )
+                with mover_cols[1]:
+                    top_minimum_volume_5m = st.number_input(
+                        "Minimum 5m volume ($)",
+                        min_value=0.0,
+                        max_value=10_000_000.0,
+                        value=1_000.0,
+                        step=500.0,
+                        key="top_minimum_volume_5m_v1",
+                        help="Recent dollar volume, not lifetime or 24-hour volume.",
+                    )
+                with mover_cols[2]:
+                    top_minimum_volume_1h = st.number_input(
+                        "Minimum 1h volume ($)",
+                        min_value=0.0,
+                        max_value=100_000_000.0,
+                        value=10_000.0,
+                        step=2_500.0,
+                        key="top_minimum_volume_1h_v1",
+                        help="Requires sustained recent dollar flow instead of a single five-minute burst.",
+                    )
+                with mover_cols[3]:
+                    top_minimum_trades_5m = st.number_input(
+                        "Minimum trades in 5m",
+                        min_value=0,
+                        value=10,
+                        step=5,
+                        key="top_minimum_trades_5m_v1",
+                        help="Total buys plus sells reported during the latest five-minute window.",
+                    )
+                top_mover_settings.update({
+                    "minimum_momentum": float(top_minimum_momentum),
+                    "minimum_volume_5m": float(top_minimum_volume_5m),
+                    "minimum_volume_1h": float(top_minimum_volume_1h),
+                    "minimum_trades_5m": float(top_minimum_trades_5m),
+                })
 
         if scan_profile == "Early runners":
             with st.expander("Early-runner filters", expanded=True):
@@ -820,6 +922,12 @@ if discover_tab.open:
                 "Aggressive discovery includes thin, ungraduated and weakly confirmed launches. "
                 "Treat the mover rank as an attention signal—not an entry signal."
             )
+        elif scan_profile == "Top movers":
+            st.info(
+                "Top movers requires current five-minute and one-hour dollar volume plus recent "
+                "trade activity, then ranks flow and participation ahead of price change. Results "
+                "cover the scanned five-minute trending candidates, not the entire market, and are not a buy signal."
+            )
         elif scan_profile == "Live now":
             st.info(
                 "Live now shows the current Pump.fun viewer count for indexed active livestreams. "
@@ -832,10 +940,12 @@ if discover_tab.open:
             with st.spinner("Scanning Pump tokens..."):
                 if scan_profile == "Live now":
                     coins = cached_live_mints(discovery_limit)
+                elif scan_profile == "Top movers":
+                    coins = cached_top_movers(discovery_limit)
                 else:
                     feed_sort = (
                         "last_trade_timestamp"
-                        if scan_profile in {"Early runners", "BOT trades", "Aggressive", "Top movers"}
+                        if scan_profile in {"Early runners", "BOT trades", "Aggressive"}
                         else "created_timestamp"
                     )
                     coins = cached_recent_mints(discovery_limit, feed_sort)
@@ -852,6 +962,7 @@ if discover_tab.open:
             missing_early_data_count = 0
             missing_bot_aggregate_count = 0
             missing_bot_sample_count = 0
+            missing_top_mover_data_count = 0
             holder_count = pd.to_numeric(
                 discovery_df["holder_count"], errors="coerce"
             ).replace([float("inf"), float("-inf")], float("nan"))
@@ -1017,7 +1128,7 @@ if discover_tab.open:
                         na_position="last",
                     )
                 discovery_df["mover_score"] = None
-            elif scan_profile in {"Aggressive", "Top movers"}:
+            elif scan_profile == "Aggressive":
                 discovery_df = discovery_df[
                     (discovery_df["price_change_5m"].fillna(-999.0) >= minimum_momentum)
                     & (discovery_df["volume_24h"].fillna(0.0) >= minimum_volume)
@@ -1029,6 +1140,40 @@ if discover_tab.open:
                 ).round(1)
                 discovery_df = discovery_df.sort_values(
                     ["mover_score", "score"], ascending=[False, False], na_position="last"
+                )
+            elif scan_profile == "Top movers":
+                top_metrics = pd.DataFrame([
+                    top_mover_metrics(row)
+                    for row in discovery_df.to_dict("records")
+                ])
+                missing_top_mover_data_count = int(top_metrics["mover_score"].isna().sum())
+                for column in top_metrics:
+                    discovery_df[column] = top_metrics[column].to_numpy()
+
+                move_5m = pd.to_numeric(
+                    discovery_df["price_change_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                volume_5m = pd.to_numeric(
+                    discovery_df["volume_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                volume_1h = pd.to_numeric(
+                    discovery_df["volume_1h"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                trades_5m = pd.to_numeric(
+                    discovery_df["trades_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                top_mover_mask = (
+                    (move_5m >= top_mover_settings["minimum_momentum"])
+                    & (volume_5m >= top_mover_settings["minimum_volume_5m"])
+                    & (volume_1h >= top_mover_settings["minimum_volume_1h"])
+                    & (trades_5m >= top_mover_settings["minimum_trades_5m"])
+                    & discovery_df["mover_score"].notna()
+                )
+                discovery_df = discovery_df[top_mover_mask].copy()
+                discovery_df = discovery_df.sort_values(
+                    ["mover_score", "volume_5m", "volume_1h", "trades_5m", "score"],
+                    ascending=[False, False, False, False, False],
+                    na_position="last",
                 )
             elif scan_profile == "Live now":
                 discovery_df["mover_score"] = None
@@ -1077,6 +1222,21 @@ if discover_tab.open:
                             "No active token matched the NTDA-like cadence in this sweep. "
                             "The default requires at least 200 trades in five minutes and 80% buys."
                         )
+                elif scan_profile == "Top movers":
+                    with st.container(horizontal=True):
+                        st.metric("Mints scanned", mints_scanned_count, border=True)
+                        st.metric("Active-volume matches", 0, border=True)
+                        st.metric("Missing recent data", missing_top_mover_data_count, border=True)
+                    if missing_top_mover_data_count == mints_scanned_count:
+                        st.info(
+                            "None of the scanned trending tokens had complete five-minute and one-hour "
+                            "volume, price, and trade-count data. Try another sweep shortly."
+                        )
+                    else:
+                        st.info(
+                            "No scanned trending token cleared every Top-mover activity threshold. "
+                            "Lower a recent-volume, trade-count, or move minimum and sweep again."
+                        )
                 else:
                     st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
@@ -1093,8 +1253,12 @@ if discover_tab.open:
                     "sustained_trades_per_minute", "bot_buy_share_pct", "median_buy_usd",
                     "micro_buy_share_pct", "top_wallet_buy_share_pct", "liquidity_to_cap_pct",
                 ]
-            elif scan_profile in {"Aggressive", "Top movers"}:
+            elif scan_profile == "Aggressive":
                 rank_columns = ["mover_score"]
+            elif scan_profile == "Top movers":
+                rank_columns = [
+                    "mover_score", "trades_5m", "trades_per_minute", "average_trade_usd"
+                ]
             else:
                 rank_columns = []
             display_columns = [
@@ -1159,6 +1323,11 @@ if discover_tab.open:
                     f"{missing_bot_sample_count} aggregate match(es) could not receive a fresh raw-trade "
                     "sample. They remain labeled AGGREGATE ONLY."
                 )
+            if scan_profile == "Top movers" and missing_top_mover_data_count:
+                st.caption(
+                    f"{missing_top_mover_data_count} scanned token(s) were skipped because complete "
+                    "five-minute or one-hour volume, price, or trade-count data was unavailable."
+                )
 
             st.dataframe(
                 discovery_df,
@@ -1195,6 +1364,7 @@ if discover_tab.open:
                         help="Automation-like risk rank; it is not proof that a wallet is operated by a bot.",
                     ),
                     "bot_flags": st.column_config.TextColumn("Raw-trade flags", width="large"),
+                    "trades_5m": st.column_config.NumberColumn("5m trades", format="%d"),
                     "trades_per_minute": st.column_config.NumberColumn("5m trades/min", format="%.1f"),
                     "sustained_trades_per_minute": st.column_config.NumberColumn(
                         "Up to 1h trades/min", format="%.1f"
@@ -1207,7 +1377,15 @@ if discover_tab.open:
                         "Top wallet buy USD", format="%.1f%%"
                     ),
                     "liquidity_to_cap_pct": st.column_config.NumberColumn("Liquidity / MC", format="%.2f%%"),
-                    "mover_score": st.column_config.NumberColumn("Mover rank", format="%.1f"),
+                    "mover_score": st.column_config.NumberColumn(
+                        "Volume/activity rank" if scan_profile == "Top movers" else "Mover rank",
+                        format="%.1f",
+                        help=(
+                            "45% five-minute volume, 20% one-hour volume, 25% five-minute trade count, and 10% price momentum."
+                            if scan_profile == "Top movers"
+                            else None
+                        ),
+                    ),
                     "score": st.column_config.ProgressColumn("Risk score", min_value=0, max_value=100),
                     "market_cap_usd": st.column_config.NumberColumn("Market cap", format="$%.0f"),
                     "liquidity_usd": st.column_config.NumberColumn("Liquidity", format="$%.0f"),
@@ -1242,6 +1420,14 @@ if discover_tab.open:
                         f"${row['symbol']} · {row['bot_signal']} "
                         f"{row['bot_score']:.0f}/100 · {money(row['market_cap_usd'])} "
                         f"· {str(row['mint'])[-6:]}"
+                    ): row["mint"]
+                    for row in discovery_df.to_dict("records")
+                }
+            elif scan_profile == "Top movers":
+                candidate_labels = {
+                    (
+                        f"${row['symbol']} · {row['mover_score']:.0f}/100 activity · "
+                        f"{money(row['volume_5m'])} in 5m · {str(row['mint'])[-6:]}"
                     ): row["mint"]
                     for row in discovery_df.to_dict("records")
                 }
