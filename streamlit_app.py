@@ -359,25 +359,36 @@ def bot_trade_metrics(
     raw_sample = raw_sample or {}
     raw_status = str(raw_sample.get("bot_data_status") or "UNAVAILABLE")
     raw_trade_count = numeric_value(raw_sample.get("raw_trade_count_1m"))
+    raw_buy_count = numeric_value(raw_sample.get("raw_buys_1m"))
+    raw_buy_share = numeric_value(raw_sample.get("raw_buy_share_pct"))
     median_buy = numeric_value(raw_sample.get("median_buy_usd"))
     micro_share = numeric_value(raw_sample.get("micro_buy_share_pct"))
     top_wallet_share = numeric_value(raw_sample.get("top_wallet_buy_share_pct"))
     top3_share = numeric_value(raw_sample.get("top3_wallet_buy_share_pct"))
+    raw_flow_qualifies = bool(
+        raw_status == "SAMPLED"
+        and raw_trade_count is not None
+        and raw_trade_count >= settings["minimum_raw_trades"]
+        and raw_buy_count is not None
+        and raw_buy_count >= settings["minimum_raw_buys"]
+        and raw_buy_share is not None
+        and raw_buy_share >= settings["minimum_buy_share"]
+    )
 
     recent_rate_fit = min(1.0, trades_per_minute / 60.0)
     sustained_rate_fit = min(1.0, sustained_trades_per_minute / 50.0)
     buy_direction_fit = max(0.0, min(1.0, (buy_share - 0.50) / 0.47))
     micro_fit = (
         max(0.0, min(1.0, (micro_share - 25.0) / 50.0))
-        if micro_share is not None else 0.0
+        if raw_flow_qualifies and micro_share is not None else 0.0
     )
     wallet_fit = (
         max(0.0, min(1.0, (top_wallet_share - 25.0) / 70.0))
-        if top_wallet_share is not None else 0.0
+        if raw_flow_qualifies and top_wallet_share is not None else 0.0
     )
     top3_fit = (
         max(0.0, min(1.0, (top3_share - 50.0) / 50.0))
-        if top3_share is not None else 0.0
+        if raw_flow_qualifies and top3_share is not None else 0.0
     )
     liquidity_gap_fit = (
         max(0.0, min(1.0, 1.0 - liquidity_to_cap / 0.03))
@@ -396,15 +407,15 @@ def bot_trade_metrics(
 
     flags: list[str] = []
     micro_swarm = bool(
-        raw_trade_count is not None
-        and raw_trade_count >= settings["minimum_raw_trades"]
+        raw_flow_qualifies
         and median_buy is not None
         and median_buy <= settings["maximum_median_buy"]
         and micro_share is not None
         and micro_share >= settings["minimum_micro_share"]
     )
     concentrated_usd = bool(
-        top_wallet_share is not None
+        raw_flow_qualifies
+        and top_wallet_share is not None
         and top_wallet_share >= settings["minimum_top_wallet_share"]
     )
     if micro_swarm:
@@ -534,6 +545,7 @@ if discover_tab.open:
             "minimum_5m_trades": 200.0,
             "minimum_buy_share": 80.0,
             "minimum_raw_trades": 40.0,
+            "minimum_raw_buys": 30.0,
             "maximum_median_buy": 0.25,
             "minimum_micro_share": 50.0,
             "minimum_top_wallet_share": 50.0,
@@ -694,6 +706,13 @@ if discover_tab.open:
                         step=10,
                         key="bot_minimum_raw_trades_v1",
                     )
+                    bot_minimum_raw_buys = st.number_input(
+                        "Minimum raw buys in 1m",
+                        min_value=0,
+                        value=30,
+                        step=10,
+                        key="bot_minimum_raw_buys_v1",
+                    )
                 with bot_cols[1]:
                     bot_maximum_market_cap = st.number_input(
                         "Maximum market cap ($)",
@@ -752,6 +771,7 @@ if discover_tab.open:
                     "minimum_5m_trades": float(bot_minimum_5m_trades),
                     "minimum_buy_share": float(bot_minimum_buy_share),
                     "minimum_raw_trades": float(bot_minimum_raw_trades),
+                    "minimum_raw_buys": float(bot_minimum_raw_buys),
                     "maximum_median_buy": float(bot_maximum_median_buy),
                     "minimum_micro_share": float(bot_minimum_micro_share),
                     "minimum_top_wallet_share": float(bot_minimum_top_wallet_share),
@@ -806,7 +826,8 @@ if discover_tab.open:
             discovery_df = pd.DataFrame(discovery_rows)
             mints_scanned_count = len(discovery_df)
             missing_early_data_count = 0
-            missing_bot_data_count = 0
+            missing_bot_aggregate_count = 0
+            missing_bot_sample_count = 0
             if scan_profile == "Early runners":
                 early_metrics = pd.DataFrame([
                     early_runner_metrics(row, early_settings)
@@ -906,6 +927,17 @@ if discover_tab.open:
                 trades_1h = buys_1h + sells_1h
                 buy_share_pct = buys_5m.div(trades_5m.where(trades_5m > 0)) * 100.0
                 complete = discovery_df["complete"].fillna(False).astype(bool)
+                aggregate_missing = (
+                    market_cap.isna()
+                    | age_minutes.isna()
+                    | volume_5m.isna()
+                    | buys_5m.isna()
+                    | sells_5m.isna()
+                    | buys_1h.isna()
+                    | sells_1h.isna()
+                    | (trades_1h < trades_5m)
+                )
+                missing_bot_aggregate_count = int(aggregate_missing.sum())
 
                 bot_mask = (
                     market_cap.between(
@@ -944,7 +976,7 @@ if discover_tab.open:
                     ])
                     for column in bot_metrics:
                         discovery_df[column] = bot_metrics[column].to_numpy()
-                    missing_bot_data_count = int(
+                    missing_bot_sample_count = int(
                         (discovery_df["bot_sample_status"] != "SAMPLED").sum()
                     )
                     discovery_df = discovery_df.sort_values(
@@ -996,10 +1028,17 @@ if discover_tab.open:
                     with st.container(horizontal=True):
                         st.metric("Mints scanned", mints_scanned_count, border=True)
                         st.metric("BOT-pattern matches", 0, border=True)
-                    st.info(
-                        "No active token matched the NTDA-like cadence in this sweep. "
-                        "The default requires at least 200 trades in five minutes and 80% buys."
-                    )
+                        st.metric("Missing BOT data", missing_bot_aggregate_count, border=True)
+                    if missing_bot_aggregate_count == mints_scanned_count:
+                        st.info(
+                            "None of the scanned tokens had complete five-minute and one-hour "
+                            "market data for BOT-pattern screening. Try another sweep shortly."
+                        )
+                    else:
+                        st.info(
+                            "No active token matched the NTDA-like cadence in this sweep. "
+                            "The default requires at least 200 trades in five minutes and 80% buys."
+                        )
                 else:
                     st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
@@ -1056,9 +1095,14 @@ if discover_tab.open:
                     f"{missing_early_data_count} scanned token(s) were skipped because recent "
                     "market or five-minute order-flow data was unavailable."
                 )
-            if scan_profile == "BOT trades" and missing_bot_data_count:
+            if scan_profile == "BOT trades" and missing_bot_aggregate_count:
                 st.caption(
-                    f"{missing_bot_data_count} aggregate match(es) could not receive a fresh raw-trade "
+                    f"{missing_bot_aggregate_count} scanned token(s) were skipped because complete "
+                    "five-minute or one-hour market data was unavailable."
+                )
+            if scan_profile == "BOT trades" and missing_bot_sample_count:
+                st.caption(
+                    f"{missing_bot_sample_count} aggregate match(es) could not receive a fresh raw-trade "
                     "sample. They remain labeled AGGREGATE ONLY."
                 )
 

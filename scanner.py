@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 import re
 from statistics import median
 import time
@@ -228,44 +229,49 @@ def analyze_bot_trades(mint: str, limit: int = 100) -> dict[str, Any]:
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         amount_usd = _extract_percent(trade.get("amountUsd"))
-        if amount_usd is None:
+        if amount_usd is None or not math.isfinite(amount_usd) or amount_usd <= 0:
             continue
+        wallet_value = trade.get("userAddress")
+        wallet = wallet_value.strip() if isinstance(wallet_value, str) else None
         parsed.append({
             "timestamp": timestamp,
             "side": str(trade.get("type") or "").lower(),
-            "wallet": str(trade.get("userAddress") or "unknown"),
-            "amount_usd": max(0.0, amount_usd),
+            "wallet": wallet or None,
+            "amount_usd": amount_usd,
         })
 
     if not parsed:
         return {"bot_data_status": "NO TRADES"}
 
+    now = datetime.now(timezone.utc)
     latest = max(trade["timestamp"] for trade in parsed)
-    latest_age_seconds = max(0.0, (datetime.now(timezone.utc) - latest).total_seconds())
-    if latest_age_seconds > 120.0:
+    latest_age_seconds = max(0.0, (now - latest).total_seconds())
+    cutoff_epoch = now.timestamp() - 60.0
+    window = [
+        trade
+        for trade in parsed
+        if cutoff_epoch <= trade["timestamp"].timestamp() <= now.timestamp() + 5.0
+    ]
+    if not window:
         return {
             "bot_data_status": "STALE",
             "raw_latest_trade_at": latest.isoformat(),
             "raw_latest_trade_age_seconds": round(latest_age_seconds, 1),
         }
-    cutoff_epoch = latest.timestamp() - 60.0
-    window = [trade for trade in parsed if trade["timestamp"].timestamp() >= cutoff_epoch]
     buys = [trade for trade in window if trade["side"] == "buy"]
     sells = [trade for trade in window if trade["side"] == "sell"]
     buy_sizes = [trade["amount_usd"] for trade in buys]
     buy_volume = sum(buy_sizes)
     wallet_volume: dict[str, float] = {}
     for trade in buys:
-        wallet_volume[trade["wallet"]] = wallet_volume.get(trade["wallet"], 0.0) + trade["amount_usd"]
+        wallet = trade["wallet"]
+        if wallet:
+            wallet_volume[wallet] = wallet_volume.get(wallet, 0.0) + trade["amount_usd"]
     ranked_wallet_volume = sorted(wallet_volume.values(), reverse=True)
 
-    pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
-    next_cursor = str(pagination.get("nextCursor") or "")
-    cursor_timestamp_ms = _extract_int(next_cursor.rsplit("-", 1)[-1]) if "-" in next_cursor else None
     truncated = bool(
-        pagination.get("hasMore")
-        and cursor_timestamp_ms is not None
-        and cursor_timestamp_ms / 1000 >= cutoff_epoch
+        len(payload["trades"]) >= safe_limit
+        and min(trade["timestamp"].timestamp() for trade in parsed) >= cutoff_epoch
     )
 
     median_buy = median(buy_sizes) if buy_sizes else None
