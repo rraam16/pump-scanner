@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import re
 import time
 from typing import Any
 
@@ -29,6 +30,7 @@ PUMP_CURRENTLY_LIVE = (
     "?offset=0&limit=1000&includeNsfw=false"
 )
 PUMP_LIVESTREAM = "https://livestream-api.pump.fun/livestream?mintId={mint}"
+PUMP_COIN_PAGE = "https://pump.fun/coin/{mint}"
 PUMP_RECENT_SEARCH = (
     "https://frontend-api-v3.pump.fun/coins/search-unrestricted"
     "?offset=0&limit={limit}&sort={sort_by}&order=desc&includeNsfw=false"
@@ -111,6 +113,19 @@ def _get_json(url: str, *, timeout: int = 15) -> Any:
     response = requests.get(url, timeout=timeout, headers={"User-Agent": "PumpScanner/1.0"})
     response.raise_for_status()
     return response.json()
+
+
+def _get_text(url: str, *, timeout: int = 15) -> str:
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers={
+            "User-Agent": "PumpScanner/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    response.raise_for_status()
+    return response.text
 
 
 def _rpc(method: str, params: list[Any]) -> Any:
@@ -234,6 +249,35 @@ def _live_roster() -> dict[str, dict[str, Any]]:
     return _LIVE_ROSTER_CACHE
 
 
+def _livestream_status_from_coin_page(mint: str) -> dict[str, Any] | None:
+    """Read Pump's server-rendered live status when its JSON host is blocked."""
+    try:
+        page = _get_text(PUMP_COIN_PAGE.format(mint=mint), timeout=10)
+    except requests.RequestException:
+        return None
+
+    # Pump embeds the current livestream object in its Next.js page data. The
+    # JSON quotes are escaped inside a script tag, so normalize them before
+    # locating the object for this exact mint. Keeping the search mint-scoped
+    # prevents a previous-stream count elsewhere on the page from being used.
+    normalized = page.replace('\\"', '"')
+    marker = re.compile(rf'"mintId"\s*:\s*"{re.escape(mint)}"')
+    for match in marker.finditer(normalized):
+        window = normalized[match.start():match.start() + 3_000]
+        live_match = re.search(r'"isLive"\s*:\s*(true|false)', window, re.IGNORECASE)
+        if not live_match:
+            continue
+        count_match = re.search(r'"numParticipants"\s*:\s*(\d+)', window)
+        status: dict[str, Any] = {
+            "mintId": mint,
+            "isLive": live_match.group(1).lower() == "true",
+        }
+        if count_match:
+            status["numParticipants"] = int(count_match.group(1))
+        return status
+    return None
+
+
 def _livestream_status(mint: str) -> dict[str, Any] | None:
     """Read Pump's per-mint livestream status with a rate-friendly cache."""
     now = time.monotonic()
@@ -241,11 +285,24 @@ def _livestream_status(mint: str) -> dict[str, Any] | None:
     if cached and now - cached[0] < _LIVESTREAM_TTL_SECONDS:
         return dict(cached[1]) if cached[1] is not None else None
 
+    api_failed = False
     try:
-        payload = _get_json(PUMP_LIVESTREAM.format(mint=mint), timeout=6)
-    except (requests.RequestException, ValueError):
+        response = requests.get(
+            PUMP_LIVESTREAM.format(mint=mint),
+            timeout=6,
+            headers={"User-Agent": "PumpScanner/1.0"},
+        )
+        response.raise_for_status()
+        payload = response.json() if response.content.strip() else None
+    except requests.RequestException:
+        api_failed = True
+        payload = None
+    except ValueError:
+        api_failed = True
         payload = None
     status = dict(payload) if isinstance(payload, dict) else None
+    if api_failed:
+        status = _livestream_status_from_coin_page(mint)
 
     if len(_LIVESTREAM_CACHE) >= 500:
         expired = [
@@ -296,8 +353,10 @@ def _merge_live_status(coin: dict[str, Any], mint: str) -> dict[str, Any]:
     live_coin = _live_roster().get(mint)
     if live_coin:
         merged["is_currently_live"] = True
-        merged["num_participants"] = live_coin.get("num_participants")
-        return merged
+        viewers = _live_viewers(live_coin)
+        if viewers is not None:
+            merged["num_participants"] = viewers
+            return merged
 
     # Pump's per-mint service is useful when a just-started stream has not yet
     # appeared in the roster. It uses camelCase and may return an empty body.
