@@ -120,7 +120,7 @@ def percent(value: float | None) -> str:
 
 
 def age_label(value: float | None) -> str:
-    if value is None:
+    if value is None or pd.isna(value):
         return "—"
     if value < 60:
         return f"{value:.0f}m"
