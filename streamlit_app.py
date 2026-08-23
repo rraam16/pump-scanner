@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
@@ -95,7 +96,6 @@ def auto_scan_scheduler(interval_minutes: int) -> None:
     remaining_seconds = interval_minutes * 60 - (now - last_run)
     if remaining_seconds <= 0:
         st.session_state.last_auto_scan_at = now
-        st.cache_data.clear()
         st.rerun()
 
     remaining_minutes = max(1, int((remaining_seconds + 59) // 60))
@@ -138,6 +138,159 @@ def pump_viewer_count_label(is_live: object, viewers: object) -> str:
     return f"{int(viewers):,}"
 
 
+def numeric_value(value: object) -> float | None:
+    """Return a finite scalar without letting missing dataframe values leak through."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def band_fit(
+    value: float,
+    outer_low: float,
+    ideal_low: float,
+    ideal_high: float,
+    outer_high: float,
+) -> float:
+    """Score 0–1 inside a preferred band, tapering toward the outer limits."""
+    if value < outer_low or value > outer_high:
+        return 0.0
+    if ideal_low <= value <= ideal_high:
+        return 1.0
+    if value < ideal_low:
+        width = max(ideal_low - outer_low, 1e-9)
+        return max(0.0, min(1.0, (value - outer_low) / width))
+    width = max(outer_high - ideal_high, 1e-9)
+    return max(0.0, min(1.0, (outer_high - value) / width))
+
+
+def preferred_band(
+    outer_low: float,
+    preferred_low: float,
+    preferred_high: float,
+    outer_high: float,
+) -> tuple[float, float]:
+    """Clamp a preferred scoring band inside user-selected outer limits."""
+    ideal_low = max(outer_low, min(preferred_low, outer_high))
+    ideal_high = max(ideal_low, min(preferred_high, outer_high))
+    return ideal_low, ideal_high
+
+
+def early_runner_metrics(row: dict[str, object], settings: dict[str, float]) -> dict[str, object]:
+    """Measure low-cap momentum, turnover, and buy pressure for an early-runner row."""
+    market_cap = numeric_value(row.get("market_cap_usd"))
+    age = numeric_value(row.get("age_minutes"))
+    move_5m = numeric_value(row.get("price_change_5m"))
+    move_1h = numeric_value(row.get("price_change_1h"))
+    volume = numeric_value(row.get("volume_5m"))
+    buys = numeric_value(row.get("buys_5m"))
+    sells = numeric_value(row.get("sells_5m"))
+    required = (market_cap, age, move_5m, volume, buys, sells)
+    if any(value is None for value in required) or market_cap <= 0:
+        return {
+            "early_score": None,
+            "early_signal": "NEEDS DATA",
+            "buy_share_pct": None,
+            "volume_to_cap": None,
+            "trade_count": None,
+        }
+
+    trade_count = buys + sells
+    buy_share = buys / trade_count if trade_count > 0 else 0.0
+    turnover = volume / market_cap
+
+    cap_ideal = preferred_band(
+        settings["minimum_market_cap"],
+        10_000.0,
+        20_000.0,
+        settings["maximum_market_cap"],
+    )
+    age_ideal = preferred_band(
+        settings["minimum_age"],
+        20.0,
+        75.0,
+        settings["maximum_age"],
+    )
+    momentum_ideal = preferred_band(
+        settings["minimum_momentum"],
+        15.0,
+        50.0,
+        settings["maximum_momentum"],
+    )
+
+    cap_fit = band_fit(
+        market_cap,
+        settings["minimum_market_cap"],
+        cap_ideal[0],
+        cap_ideal[1],
+        settings["maximum_market_cap"],
+    )
+    age_fit = band_fit(
+        age,
+        settings["minimum_age"],
+        age_ideal[0],
+        age_ideal[1],
+        settings["maximum_age"],
+    )
+    momentum_fit = band_fit(
+        move_5m,
+        settings["minimum_momentum"],
+        momentum_ideal[0],
+        momentum_ideal[1],
+        settings["maximum_momentum"],
+    )
+    if move_1h is None:
+        one_hour_fit = 0.5 if age < 60 else 0.0
+    else:
+        one_hour_fit = band_fit(move_1h, -10.0, 15.0, 120.0, 250.0)
+
+    minimum_turnover = settings.get("minimum_turnover", 0.12)
+    target_turnover = max(0.30, minimum_turnover * 2.0)
+    turnover_fit = max(
+        0.0,
+        min(1.0, (turnover - minimum_turnover) / max(target_turnover - minimum_turnover, 1e-9)),
+    )
+    buy_pressure_fit = max(0.0, min(1.0, (buy_share - 0.50) / 0.20))
+    buy_pressure_fit *= min(1.0, trade_count / 75.0)
+    activity_fit = max(0.0, min(1.0, (trade_count - 25.0) / 75.0))
+    score = (
+        25.0 * cap_fit
+        + 10.0 * age_fit
+        + 15.0 * momentum_fit
+        + 10.0 * one_hour_fit
+        + 15.0 * turnover_fit
+        + 15.0 * buy_pressure_fit
+        + 10.0 * activity_fit
+    )
+    if move_5m > 65.0:
+        score -= min(10.0, (move_5m - 65.0) / 35.0 * 10.0)
+    if turnover > 2.0:
+        score -= 10.0
+    if bool(row.get("complete")):
+        score -= 10.0
+
+    score = round(max(0.0, min(100.0, score)), 1)
+    extended = move_5m > 65.0 or turnover > 2.0
+    signal = (
+        "EXTENDED"
+        if extended
+        else "HIGH MATCH"
+        if score >= 70 and trade_count >= 50
+        else "WATCH"
+        if score >= 55
+        else "LOW"
+    )
+    return {
+        "early_score": score,
+        "early_signal": signal,
+        "buy_share_pct": round(buy_share * 100.0, 1),
+        "volume_to_cap": round(turnover, 2),
+        "trade_count": int(trade_count),
+    }
+
+
 def verdict_badge(verdict: str) -> str:
     colors = {
         "ENTRY ELIGIBLE": "green",
@@ -157,7 +310,13 @@ with st.sidebar:
     maximum_bundler = st.number_input("Maximum bundlers (%)", 0.0, 100.0, 5.0, 1.0)
     maximum_5m = st.number_input("Maximum five-minute rise (%)", 0.0, 10_000.0, 35.0, 5.0)
     minimum_holders = st.number_input("Minimum holders", 0, 1_000_000, 100, 25)
-    reject_modes = st.pills("Reject launch modes", ["BOOST", "Mayhem"], default=["BOOST", "Mayhem"], selection_mode="multi")
+    reject_modes = st.pills(
+        "Reject detected launch modes",
+        ["BOOST", "Mayhem"],
+        default=["BOOST", "Mayhem"],
+        selection_mode="multi",
+        help="The quick market feed may not report a launch mode. Deep scan and verify Pump's audit panel.",
+    )
     st.caption("Rules are guardrails, not guarantees. The scanner never places trades.")
 
 rules = Rules(
@@ -192,11 +351,24 @@ if discover_tab.open:
         )
         scan_profile = st.segmented_control(
             "Ranking profile",
-            ["Aggressive", "Top movers", "Live now", "Risk-first"],
-            default="Aggressive",
-            key="scan_profile_v3",
-            help="Live now ranks active Pump livestreams by Pump.fun viewer count.",
+            ["Early runners", "Aggressive", "Top movers", "Live now", "Risk-first"],
+            default="Early runners",
+            key="scan_profile_v4",
+            help="Early runners ranks young, low-cap tokens by momentum, turnover, and buy pressure.",
         )
+        early_ungraduated_only = True
+        early_settings = {
+            "minimum_market_cap": 8_000.0,
+            "maximum_market_cap": 30_000.0,
+            "minimum_age": 15.0,
+            "maximum_age": 120.0,
+            "minimum_momentum": 5.0,
+            "maximum_momentum": 80.0,
+            "minimum_volume": 1_000.0,
+            "minimum_turnover": 0.12,
+            "minimum_buy_ratio": 1.40,
+            "minimum_trades": 25.0,
+        }
         with st.container(horizontal=True, vertical_alignment="bottom"):
             discovery_limit = st.select_slider(
                 "Mints per sweep",
@@ -204,11 +376,20 @@ if discover_tab.open:
                 value=50,
                 key="discovery_limit_v2",
             )
-            graduated_only = st.toggle("Graduated only", value=False)
+            if scan_profile == "Early runners":
+                early_ungraduated_only = st.toggle(
+                    "Ungraduated only",
+                    value=True,
+                    help="Matches the pre-graduation stage of the example runner.",
+                )
+                graduated_only = False
+            else:
+                graduated_only = st.toggle("Graduated only", value=False)
             auto_scan_label = st.selectbox(
                 "Automatic sweep",
                 ["Off"] + [f"Every {minute} min" for minute in range(1, 16)],
-                index=0,
+                index=1 if scan_profile == "Early runners" else 0,
+                key=f"auto_scan_label_{scan_profile.lower().replace(' ', '_')}_v3",
                 help="Runs while the Discover view remains open.",
             )
             if scan_profile in {"Aggressive", "Top movers"}:
@@ -237,9 +418,83 @@ if discover_tab.open:
                 st.cache_data.clear()
                 st.rerun()
 
+        if scan_profile == "Early runners":
+            with st.expander("Early-runner filters", expanded=True):
+                cap_range = st.slider(
+                    "Market-cap window ($)",
+                    3_000,
+                    100_000,
+                    (8_000, 30_000),
+                    1_000,
+                )
+                age_range = st.slider(
+                    "Token-age window (minutes)",
+                    1,
+                    360,
+                    (15, 120),
+                    1,
+                )
+                momentum_range = st.slider(
+                    "5-minute move window (%)",
+                    -20.0,
+                    200.0,
+                    (5.0, 80.0),
+                    1.0,
+                )
+                filter_cols = st.columns(4)
+                with filter_cols[0]:
+                    early_minimum_volume = st.number_input(
+                        "Minimum 5m volume ($)",
+                        min_value=0.0,
+                        value=1_000.0,
+                        step=500.0,
+                    )
+                with filter_cols[1]:
+                    early_minimum_turnover = st.number_input(
+                        "Minimum 5m volume / market cap",
+                        min_value=0.0,
+                        value=0.12,
+                        step=0.05,
+                        help="Recent turnover helps separate active demand from stale lifetime volume.",
+                    )
+                with filter_cols[2]:
+                    early_minimum_buy_ratio = st.number_input(
+                        "Minimum buys / sells",
+                        min_value=0.0,
+                        value=1.40,
+                        step=0.05,
+                        help="Uses the most recent five-minute trade counts.",
+                    )
+                with filter_cols[3]:
+                    early_minimum_trades = st.number_input(
+                        "Minimum trades",
+                        min_value=0,
+                        value=25,
+                        step=5,
+                    )
+                early_settings.update({
+                    "minimum_market_cap": float(cap_range[0]),
+                    "maximum_market_cap": float(cap_range[1]),
+                    "minimum_age": float(age_range[0]),
+                    "maximum_age": float(age_range[1]),
+                    "minimum_momentum": float(momentum_range[0]),
+                    "maximum_momentum": float(momentum_range[1]),
+                    "minimum_volume": float(early_minimum_volume),
+                    "minimum_turnover": float(early_minimum_turnover),
+                    "minimum_buy_ratio": float(early_minimum_buy_ratio),
+                    "minimum_trades": float(early_minimum_trades),
+                })
+
         auto_scan_minutes = 0 if auto_scan_label == "Off" else int(auto_scan_label.split()[1])
         auto_scan_scheduler(auto_scan_minutes)
-        if scan_profile == "Aggressive":
+        if scan_profile == "Early runners":
+            st.info(
+                "Early runners targets the same broad entry-stage signature: young, low-cap tokens "
+                "with strong five-minute turnover and buy pressure. A HIGH MATCH is an attention "
+                "signal, not a buy signal. Some launch-mode and audit fields are unavailable in "
+                "the quick feed, so deep-scan every candidate."
+            )
+        elif scan_profile == "Aggressive":
             st.warning(
                 "Aggressive discovery includes thin, ungraduated and weakly confirmed launches. "
                 "Treat the mover rank as an attention signal—not an entry signal."
@@ -259,7 +514,7 @@ if discover_tab.open:
                 else:
                     feed_sort = (
                         "last_trade_timestamp"
-                        if scan_profile in {"Aggressive", "Top movers"}
+                        if scan_profile in {"Early runners", "Aggressive", "Top movers"}
                         else "created_timestamp"
                     )
                     coins = cached_recent_mints(discovery_limit, feed_sort)
@@ -272,7 +527,82 @@ if discover_tab.open:
 
         if discovery_rows:
             discovery_df = pd.DataFrame(discovery_rows)
-            if scan_profile in {"Aggressive", "Top movers"}:
+            mints_scanned_count = len(discovery_df)
+            missing_early_data_count = 0
+            if scan_profile == "Early runners":
+                early_metrics = pd.DataFrame([
+                    early_runner_metrics(row, early_settings)
+                    for row in discovery_df.to_dict("records")
+                ])
+                missing_early_data_count = int(early_metrics["early_score"].isna().sum())
+                for column in early_metrics:
+                    discovery_df[column] = early_metrics[column]
+
+                market_cap = pd.to_numeric(
+                    discovery_df["market_cap_usd"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                age_minutes = pd.to_numeric(
+                    discovery_df["age_minutes"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                move_5m = pd.to_numeric(
+                    discovery_df["price_change_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                volume_5m = pd.to_numeric(
+                    discovery_df["volume_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                buys_5m = pd.to_numeric(
+                    discovery_df["buys_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                sells_5m = pd.to_numeric(
+                    discovery_df["sells_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                trade_count = buys_5m + sells_5m
+                buy_ratio = buys_5m.div(sells_5m.where(sells_5m > 0))
+                buy_ratio = buy_ratio.mask((sells_5m == 0) & (buys_5m > 0), float("inf"))
+                turnover = volume_5m.div(market_cap.where(market_cap > 0))
+                complete = discovery_df["complete"].fillna(False).astype(bool)
+                liquidity = pd.to_numeric(discovery_df["liquidity_usd"], errors="coerce")
+                graduated_quality = (
+                    (liquidity >= 8_000.0)
+                    & (liquidity.div(market_cap.where(market_cap > 0)) >= 0.15)
+                )
+
+                early_mask = (
+                    market_cap.between(
+                        early_settings["minimum_market_cap"],
+                        early_settings["maximum_market_cap"],
+                    )
+                    & age_minutes.between(
+                        early_settings["minimum_age"],
+                        early_settings["maximum_age"],
+                    )
+                    & move_5m.between(
+                        early_settings["minimum_momentum"],
+                        early_settings["maximum_momentum"],
+                    )
+                    & (volume_5m >= early_settings["minimum_volume"])
+                    & (turnover >= early_settings["minimum_turnover"])
+                    & (trade_count >= early_settings["minimum_trades"])
+                    & (buy_ratio >= early_settings["minimum_buy_ratio"])
+                    & discovery_df["early_score"].notna()
+                )
+                if rules.reject_boost:
+                    early_mask &= ~discovery_df["boost_mode"].fillna(False).astype(bool)
+                if rules.reject_mayhem:
+                    early_mask &= ~discovery_df["mayhem_mode"].fillna(False).astype(bool)
+                if early_ungraduated_only:
+                    early_mask &= ~complete
+                else:
+                    early_mask &= (~complete) | graduated_quality
+
+                discovery_df = discovery_df[early_mask].copy()
+                discovery_df["mover_score"] = None
+                discovery_df = discovery_df.sort_values(
+                    ["early_score", "score"],
+                    ascending=[False, False],
+                    na_position="last",
+                )
+            elif scan_profile in {"Aggressive", "Top movers"}:
                 discovery_df = discovery_df[
                     (discovery_df["price_change_5m"].fillna(-999.0) >= minimum_momentum)
                     & (discovery_df["volume_24h"].fillna(0.0) >= minimum_volume)
@@ -296,19 +626,42 @@ if discover_tab.open:
                     ["score", "market_cap_usd"], ascending=[False, False], na_position="last"
                 )
             if discovery_df.empty:
-                st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
+                if scan_profile == "Early runners":
+                    with st.container(horizontal=True):
+                        st.metric("Mints scanned", mints_scanned_count, border=True)
+                        st.metric("Matches", 0, border=True)
+                        st.metric("Missing recent data", missing_early_data_count, border=True)
+                    if missing_early_data_count == mints_scanned_count:
+                        st.info(
+                            "None of the scanned tokens had enough five-minute market and order-flow "
+                            "data to rank. Try another sweep in a minute."
+                        )
+                    else:
+                        st.info(
+                            "No tokens matched every early-runner filter in this sweep. "
+                            "Widen the cap or momentum window, or lower the turnover/order-flow minimums."
+                        )
+                else:
+                    st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
-            rank_columns = ["mover_score"] if scan_profile in {"Aggressive", "Top movers"} else []
+            if scan_profile == "Early runners":
+                rank_columns = [
+                    "early_signal", "early_score", "buy_share_pct", "volume_to_cap", "trade_count"
+                ]
+            elif scan_profile in {"Aggressive", "Top movers"}:
+                rank_columns = ["mover_score"]
+            else:
+                rank_columns = []
             display_columns = [
                 "symbol", "verdict", *rank_columns, "score", "market_cap_usd", "liquidity_usd",
-                "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
+                "price_change_5m", "price_change_1h", "volume_5m", "volume_24h", "age", "live_viewers",
                 "complete", "mint",
             ]
             discovery_df["age"] = discovery_df["age_minutes"].map(age_label)
             live_stream_count = int(discovery_df["is_currently_live"].fillna(False).sum())
             graduated_count = int(discovery_df["complete"].fillna(False).sum())
             cleared_hard_rules = int(
-                discovery_df["verdict"].isin(["PASS", "HARD PASS"]).sum()
+                (~discovery_df["verdict"].isin(["PASS", "HARD PASS"])).sum()
             )
             for column in display_columns:
                 if column not in discovery_df:
@@ -319,7 +672,8 @@ if discover_tab.open:
             discovery_df = discovery_df[display_columns]
 
             with st.container(horizontal=True):
-                st.metric("Mints scanned", len(discovery_df), border=True)
+                st.metric("Mints scanned", mints_scanned_count, border=True)
+                st.metric("Matches", len(discovery_df), border=True)
                 st.metric(
                     "Live streams",
                     live_stream_count,
@@ -332,6 +686,12 @@ if discover_tab.open:
                     border=True,
                 )
 
+            if scan_profile == "Early runners" and missing_early_data_count:
+                st.caption(
+                    f"{missing_early_data_count} scanned token(s) were skipped because recent "
+                    "market or five-minute order-flow data was unavailable."
+                )
+
             st.dataframe(
                 discovery_df,
                 hide_index=True,
@@ -339,12 +699,27 @@ if discover_tab.open:
                 column_config={
                     "symbol": st.column_config.TextColumn("Token", pinned=True),
                     "verdict": st.column_config.TextColumn("Quick decision"),
+                    "early_signal": st.column_config.TextColumn("Similarity"),
+                    "early_score": st.column_config.ProgressColumn(
+                        "Early rank",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f",
+                        help="Similarity rank from cap, age, momentum, recent turnover, and recent order flow.",
+                    ),
+                    "buy_share_pct": st.column_config.NumberColumn("Buy share", format="%.1f%%"),
+                    "volume_to_cap": st.column_config.NumberColumn(
+                        "5m volume / MC",
+                        format="%.2fx",
+                    ),
+                    "trade_count": st.column_config.NumberColumn("Trades", format="%.0f"),
                     "mover_score": st.column_config.NumberColumn("Mover rank", format="%.1f"),
                     "score": st.column_config.ProgressColumn("Risk score", min_value=0, max_value=100),
                     "market_cap_usd": st.column_config.NumberColumn("Market cap", format="$%.0f"),
                     "liquidity_usd": st.column_config.NumberColumn("Liquidity", format="$%.0f"),
                     "price_change_5m": st.column_config.NumberColumn("5m", format="%+.1f%%"),
                     "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
+                    "volume_5m": st.column_config.NumberColumn("5m volume", format="$%.0f"),
                     "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
                     "age": st.column_config.TextColumn("Token age"),
                     "live_viewers": st.column_config.NumberColumn(
@@ -357,10 +732,23 @@ if discover_tab.open:
                 },
             )
 
-            candidate_labels = {
-                f"${row['symbol']} · {row['score']}/100 risk · {money(row['market_cap_usd'])}": row["mint"]
-                for row in discovery_df.to_dict("records")
-            }
+            if scan_profile == "Early runners":
+                candidate_labels = {
+                    (
+                        f"${row['symbol']} · {row['early_signal']} "
+                        f"{row['early_score']:.0f}/100 · {money(row['market_cap_usd'])} "
+                        f"· {str(row['mint'])[-6:]}"
+                    ): row["mint"]
+                    for row in discovery_df.to_dict("records")
+                }
+            else:
+                candidate_labels = {
+                    (
+                        f"${row['symbol']} · {row['score']}/100 risk · "
+                        f"{money(row['market_cap_usd'])} · {str(row['mint'])[-6:]}"
+                    ): row["mint"]
+                    for row in discovery_df.to_dict("records")
+                }
             selected_label = st.selectbox("Candidate to inspect", list(candidate_labels))
             selected_mint = candidate_labels[selected_label]
             with st.container(horizontal=True):

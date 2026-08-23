@@ -92,7 +92,10 @@ class ScanResult:
     price_change_5m: float | None = None
     price_change_1h: float | None = None
     price_change_24h: float | None = None
+    volume_5m: float | None = None
     volume_24h: float | None = None
+    buys_5m: int | None = None
+    sells_5m: int | None = None
     buys_24h: int | None = None
     sells_24h: int | None = None
     top10_percent: float | None = None
@@ -191,6 +194,11 @@ def _extract_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(*values: Any) -> Any:
+    """Return the first non-None value while preserving legitimate numeric zeroes."""
+    return next((value for value in values if value is not None), None)
 
 
 def _live_viewers(coin: dict[str, Any]) -> int | None:
@@ -583,6 +591,7 @@ def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
         changes = attributes.get("price_change_percentage") or {}
         volume = attributes.get("volume_usd") or {}
         transactions = attributes.get("transactions") or {}
+        txns_5m = transactions.get("m5") or {}
         txns_24h = transactions.get("h24") or {}
         pair_address = attributes.get("address")
         coins.append({
@@ -596,7 +605,10 @@ def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
             "price_change_5m": changes.get("m5"),
             "price_change_1h": changes.get("h1"),
             "price_change_24h": changes.get("h24"),
+            "volume_5m": volume.get("m5"),
             "volume_24h": volume.get("h24"),
+            "buys_5m": txns_5m.get("buys"),
+            "sells_5m": txns_5m.get("sells"),
             "buys_24h": txns_24h.get("buys"),
             "sells_24h": txns_24h.get("sells"),
             "complete": dex_id == "pumpswap",
@@ -769,7 +781,14 @@ def scan_token(
         price_change_5m=_extract_percent(changes.get("m5") or coin.get("price_change_5m")),
         price_change_1h=_extract_percent(changes.get("h1") or coin.get("price_change_1h")),
         price_change_24h=_extract_percent(changes.get("h24") or coin.get("price_change_24h")),
+        volume_5m=_extract_percent(_first_present(volume.get("m5"), coin.get("volume_5m"))),
         volume_24h=_extract_percent(volume.get("h24") or coin.get("volume_24h")),
+        buys_5m=_extract_int(
+            _first_present((txns.get("m5") or {}).get("buys"), coin.get("buys_5m"))
+        ),
+        sells_5m=_extract_int(
+            _first_present((txns.get("m5") or {}).get("sells"), coin.get("sells_5m"))
+        ),
         buys_24h=(txns.get("h24") or {}).get("buys") or coin.get("buys_24h"),
         sells_24h=(txns.get("h24") or {}).get("sells") or coin.get("sells_24h"),
         top10_percent=(
