@@ -56,6 +56,45 @@ st.session_state.setdefault("positions", load_json(POSITIONS_FILE, DEFAULT_POSIT
 st.session_state.setdefault("last_scan", None)
 st.session_state.setdefault("last_auto_scan_at", 0.0)
 st.session_state.setdefault("last_auto_scan_at_by_profile", {})
+st.session_state.setdefault("discovery_snapshots_v2", {})
+st.session_state.setdefault("discovery_global_refresh_nonce_v2", 0)
+st.session_state.setdefault("discovery_profile_refresh_nonces_v2", {})
+
+
+def request_discovery_refresh(profile_key: str | None = None) -> None:
+    """Mark the current discovery snapshot for replacement on the next app run."""
+    if profile_key is None:
+        st.session_state.discovery_global_refresh_nonce_v2 = (
+            int(st.session_state.discovery_global_refresh_nonce_v2) + 1
+        )
+        return
+
+    refresh_nonces = dict(st.session_state.discovery_profile_refresh_nonces_v2)
+    refresh_nonces[profile_key] = int(refresh_nonces.get(profile_key, 0)) + 1
+    st.session_state.discovery_profile_refresh_nonces_v2 = refresh_nonces
+
+
+def discovery_refresh_token(profile_key: str) -> tuple[int, int]:
+    """Return the global and profile-specific refresh generations."""
+    profile_nonces = st.session_state.discovery_profile_refresh_nonces_v2
+    return (
+        int(st.session_state.discovery_global_refresh_nonce_v2),
+        int(profile_nonces.get(profile_key, 0)),
+    )
+
+
+def store_discovery_snapshot(signature: str, payload: dict[str, object]) -> None:
+    """Keep a bounded set of successful per-configuration discovery sweeps."""
+    snapshots = dict(st.session_state.discovery_snapshots_v2)
+    snapshots[signature] = dict(payload)
+    if len(snapshots) > 24:
+        oldest_signatures = sorted(
+            snapshots,
+            key=lambda key: float(snapshots[key].get("captured_at", 0.0) or 0.0),
+        )
+        for old_signature in oldest_signatures[: len(snapshots) - 24]:
+            del snapshots[old_signature]
+    st.session_state.discovery_snapshots_v2 = snapshots
 
 
 @st.cache_data(ttl="30s", max_entries=100, show_spinner=False)
@@ -133,6 +172,7 @@ def auto_scan_scheduler(interval_minutes: int, profile_key: str) -> None:
     if remaining_seconds <= 0:
         timestamps[profile_key] = now
         st.session_state.last_auto_scan_at_by_profile = timestamps
+        request_discovery_refresh(profile_key)
         st.rerun()
 
     remaining_minutes = max(1, int((remaining_seconds + 59) // 60))
@@ -522,6 +562,77 @@ def verdict_badge(verdict: str) -> str:
     return f":{colors.get(verdict, 'gray')}-badge[{verdict}]"
 
 
+@st.fragment
+def candidate_inspector(
+    scan_profile: str,
+    candidate_rows: list[dict[str, object]],
+    rules_payload: dict[str, object],
+) -> None:
+    """Inspect a frozen candidate list without rerunning discovery."""
+    labels_by_mint: dict[str, str] = {}
+    for row in candidate_rows:
+        mint = str(row["mint"])
+        if scan_profile == "Early runners":
+            label = (
+                f"${row['symbol']} · {row['early_signal']} "
+                f"{row['early_score']:.0f}/100 · {money(row['market_cap_usd'])} "
+                f"· {mint[-6:]}"
+            )
+        elif scan_profile == "BOT trades":
+            label = (
+                f"${row['symbol']} · {row['bot_signal']} "
+                f"{row['bot_score']:.0f}/100 · {money(row['market_cap_usd'])} "
+                f"· {mint[-6:]}"
+            )
+        elif scan_profile == "Top movers":
+            label = (
+                f"${row['symbol']} · {row['mover_score']:.0f}/100 activity · "
+                f"{money(row['volume_5m'])} in 5m · {mint[-6:]}"
+            )
+        else:
+            label = (
+                f"${row['symbol']} · {row['score']}/100 risk · "
+                f"{money(row['market_cap_usd'])} · {mint[-6:]}"
+            )
+        labels_by_mint[mint] = label
+
+    candidate_mints = list(labels_by_mint)
+    if not candidate_mints:
+        return
+
+    profile_key = scan_profile.lower().replace(" ", "_")
+    selection_key = f"candidate_to_inspect_{profile_key}_v1"
+    if st.session_state.get(selection_key) not in candidate_mints:
+        st.session_state[selection_key] = candidate_mints[0]
+
+    selected_mint = st.selectbox(
+        "Candidate to inspect",
+        candidate_mints,
+        format_func=labels_by_mint.__getitem__,
+        key=selection_key,
+        help="Choosing a candidate does not refresh or replace the current sweep.",
+        persist_state="session",
+    )
+    with st.container(horizontal=True):
+        if st.button("Deep scan candidate", icon=":material/search_check:"):
+            try:
+                with st.spinner("Running on-chain concentration checks..."):
+                    st.session_state.last_scan = cached_scan(selected_mint, rules_payload, {})
+                st.toast("Deep scan complete — open the Deep scan tab")
+            except ScannerError as exc:
+                st.error(str(exc))
+        if st.button("Add candidate to watchlist", icon=":material/bookmark_add:"):
+            if selected_mint not in st.session_state.watchlist:
+                st.session_state.watchlist.append(selected_mint)
+                save_json(WATCHLIST_FILE, st.session_state.watchlist)
+                st.toast("Added to watchlist")
+        st.link_button(
+            "Open Pump",
+            f"https://pump.fun/coin/{selected_mint}",
+            icon=":material/open_in_new:",
+        )
+
+
 with st.sidebar:
     st.markdown("## :material/tune: Screening rules")
     minimum_age = st.number_input("Minimum age (minutes)", 0.0, 1_440.0, 15.0, 5.0)
@@ -562,6 +673,7 @@ rules = Rules(
 with st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
     st.markdown("# :material/radar: Pump Scanner")
     if st.button("Refresh live data", icon=":material/refresh:", type="tertiary"):
+        request_discovery_refresh()
         st.cache_data.clear()
         st.rerun()
 st.caption("Automatically discovers fresh Pump.fun mints, then lets you deep-scan the candidates worth inspecting.")
@@ -673,6 +785,7 @@ if discover_tab.open:
                 timestamps = dict(st.session_state.last_auto_scan_at_by_profile)
                 timestamps[scan_profile] = time.time()
                 st.session_state.last_auto_scan_at_by_profile = timestamps
+                request_discovery_refresh(scan_profile)
                 st.cache_data.clear()
                 st.rerun()
 
@@ -936,25 +1049,112 @@ if discover_tab.open:
         else:
             st.caption("Pump.fun viewer counts appear only while a token has an active livestream. Choose Live now to scan those rooms directly.")
 
-        try:
-            with st.spinner("Scanning Pump tokens..."):
-                if scan_profile == "Live now":
-                    coins = cached_live_mints(discovery_limit)
-                elif scan_profile == "Top movers":
-                    coins = cached_top_movers(discovery_limit)
+        feed_sort = (
+            "last_trade_timestamp"
+            if scan_profile in {"Early runners", "BOT trades", "Aggressive"}
+            else "created_timestamp"
+        )
+        rules_payload = dict(rules.__dict__)
+        quick_rules_payload = dict(rules_payload)
+        quick_rules_payload["minimum_holder_count"] = 0
+        snapshot_signature = json.dumps(
+            {
+                "profile": scan_profile,
+                "discovery_limit": int(discovery_limit),
+                "graduated_only": bool(graduated_only),
+                "early_ungraduated_only": bool(early_ungraduated_only),
+                "minimum_momentum": float(minimum_momentum),
+                "minimum_volume": float(minimum_volume),
+                "early_settings": early_settings,
+                "bot_settings": bot_settings,
+                "top_mover_settings": top_mover_settings,
+                "rules": quick_rules_payload,
+                "feed_sort": feed_sort,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        refresh_token = discovery_refresh_token(scan_profile)
+        snapshots = st.session_state.discovery_snapshots_v2
+        snapshot = (
+            snapshots.get(snapshot_signature) if isinstance(snapshots, dict) else None
+        )
+        snapshot_rows = (
+            snapshot.get("rows", []) if isinstance(snapshot, dict) else []
+        )
+        if not isinstance(snapshot_rows, list):
+            snapshot_rows = []
+        matching_snapshot = bool(isinstance(snapshot, dict) and "rows" in snapshot)
+        snapshot_is_current = bool(
+            matching_snapshot
+            and tuple(snapshot.get("refresh_token", ()) or ()) == refresh_token
+        )
+        discovery_rows: list[dict[str, object]] = []
+        refresh_error: str | None = None
+
+        if snapshot_is_current:
+            discovery_rows = [dict(row) for row in snapshot_rows]
+        else:
+            try:
+                with st.spinner("Scanning Pump tokens..."):
+                    if scan_profile == "Live now":
+                        coins = cached_live_mints(discovery_limit)
+                    elif scan_profile == "Top movers":
+                        coins = cached_top_movers(discovery_limit)
+                    else:
+                        coins = cached_recent_mints(discovery_limit, feed_sort)
+                    if graduated_only:
+                        coins = [coin for coin in coins if coin.get("complete")]
+                    fetched_rows = [
+                        cached_quick_scan(coin, quick_rules_payload) for coin in coins
+                    ]
+                discovery_rows = [dict(row) for row in fetched_rows]
+                store_discovery_snapshot(
+                    snapshot_signature,
+                    {
+                        "signature": snapshot_signature,
+                        "refresh_token": refresh_token,
+                        "captured_at": time.time(),
+                        "last_refresh_attempt_at": time.time(),
+                        "is_stale": False,
+                        "refresh_error": None,
+                        "rows": [dict(row) for row in discovery_rows],
+                    },
+                )
+            except ScannerError as exc:
+                refresh_error = str(exc)
+
+            if refresh_error:
+                if matching_snapshot:
+                    fallback_snapshot = dict(snapshot)
+                    fallback_snapshot["refresh_token"] = refresh_token
+                    fallback_snapshot["last_refresh_attempt_at"] = time.time()
+                    fallback_snapshot["is_stale"] = True
+                    fallback_snapshot["refresh_error"] = refresh_error
+                    store_discovery_snapshot(snapshot_signature, fallback_snapshot)
+                    discovery_rows = [dict(row) for row in snapshot_rows]
                 else:
-                    feed_sort = (
-                        "last_trade_timestamp"
-                        if scan_profile in {"Early runners", "BOT trades", "Aggressive"}
-                        else "created_timestamp"
-                    )
-                    coins = cached_recent_mints(discovery_limit, feed_sort)
-                if graduated_only:
-                    coins = [coin for coin in coins if coin.get("complete")]
-                discovery_rows = [cached_quick_scan(coin, rules.__dict__) for coin in coins]
-        except ScannerError as exc:
-            st.error(str(exc))
-            discovery_rows = []
+                    st.error(refresh_error)
+
+        active_snapshots = st.session_state.discovery_snapshots_v2
+        active_snapshot = (
+            active_snapshots.get(snapshot_signature)
+            if isinstance(active_snapshots, dict)
+            else None
+        )
+        if isinstance(active_snapshot, dict) and active_snapshot.get("is_stale"):
+            captured_at = float(
+                active_snapshot.get("captured_at", time.time()) or time.time()
+            )
+            snapshot_age = age_label(max(0.0, time.time() - captured_at) / 60.0)
+            st.warning(
+                "Live refresh failed, so the scanner is keeping your last successful sweep."
+            )
+            st.caption(
+                f"Snapshot age: {snapshot_age}. Refresh error: "
+                f"{active_snapshot.get('refresh_error', 'Unknown error')}"
+            )
 
         if discovery_rows:
             discovery_df = pd.DataFrame(discovery_rows)
@@ -1405,56 +1605,13 @@ if discover_tab.open:
                 },
             )
 
-            if scan_profile == "Early runners":
-                candidate_labels = {
-                    (
-                        f"${row['symbol']} · {row['early_signal']} "
-                        f"{row['early_score']:.0f}/100 · {money(row['market_cap_usd'])} "
-                        f"· {str(row['mint'])[-6:]}"
-                    ): row["mint"]
-                    for row in discovery_df.to_dict("records")
-                }
-            elif scan_profile == "BOT trades":
-                candidate_labels = {
-                    (
-                        f"${row['symbol']} · {row['bot_signal']} "
-                        f"{row['bot_score']:.0f}/100 · {money(row['market_cap_usd'])} "
-                        f"· {str(row['mint'])[-6:]}"
-                    ): row["mint"]
-                    for row in discovery_df.to_dict("records")
-                }
-            elif scan_profile == "Top movers":
-                candidate_labels = {
-                    (
-                        f"${row['symbol']} · {row['mover_score']:.0f}/100 activity · "
-                        f"{money(row['volume_5m'])} in 5m · {str(row['mint'])[-6:]}"
-                    ): row["mint"]
-                    for row in discovery_df.to_dict("records")
-                }
-            else:
-                candidate_labels = {
-                    (
-                        f"${row['symbol']} · {row['score']}/100 risk · "
-                        f"{money(row['market_cap_usd'])} · {str(row['mint'])[-6:]}"
-                    ): row["mint"]
-                    for row in discovery_df.to_dict("records")
-                }
-            selected_label = st.selectbox("Candidate to inspect", list(candidate_labels))
-            selected_mint = candidate_labels[selected_label]
-            with st.container(horizontal=True):
-                if st.button("Deep scan candidate", icon=":material/search_check:"):
-                    try:
-                        with st.spinner("Running on-chain concentration checks..."):
-                            st.session_state.last_scan = cached_scan(selected_mint, rules.__dict__, {})
-                        st.toast("Deep scan complete — open the Deep scan tab")
-                    except ScannerError as exc:
-                        st.error(str(exc))
-                if st.button("Add candidate to watchlist", icon=":material/bookmark_add:"):
-                    if selected_mint not in st.session_state.watchlist:
-                        st.session_state.watchlist.append(selected_mint)
-                        save_json(WATCHLIST_FILE, st.session_state.watchlist)
-                        st.toast("Added to watchlist")
-                st.link_button("Open Pump", f"https://pump.fun/coin/{selected_mint}", icon=":material/open_in_new:")
+            candidate_inspector(
+                scan_profile,
+                discovery_df.to_dict("records"),
+                rules_payload,
+            )
+        elif refresh_error is None:
+            st.info("This sweep returned no tokens for the selected profile and filters.")
 
 if scan_tab.open:
   with scan_tab:
