@@ -4,15 +4,15 @@ The **Discover** tab automatically pulls the newest non-NSFW Pump.fun mints and 
 
 Use **Automatic sweep** to refresh the discovery results every 1–15 minutes. The Discover view must remain open; choose **Off** to disable scheduled API activity.
 
-The default **Early runners** profile scans 50 actively traded mints every minute and looks for an entry-stage pattern: ungraduated tokens between $8K and $30K market cap, 15–120 minutes old, with +5% to +800% five-minute momentum, at least $1K of five-minute volume, five-minute turnover equal to at least 12% of market cap, 25+ recent trades, and at least 1.4 buys per sell. Its similarity rank favors the $10K–$20K range and combines market-cap fit, age, momentum, recent turnover, recent order flow, and activity. Moves above +65% remain visible but are labeled **EXTENDED**. Viewer count remains visible but does not influence the rank.
+The default **Early runners** profile scans 50 actively traded mints every minute and looks for an entry-stage pattern: ungraduated tokens between $8K and $30K market cap, 15–120 minutes old, with +5% to +800% five-minute momentum, at least $1K of five-minute volume, five-minute turnover equal to at least 12% of market cap, 25+ recent trades, and at least 1.4 buys per sell. Its similarity rank favors the $10K–$20K range and combines market-cap fit, age, momentum, recent turnover, recent order flow, and activity. Moves above +65% remain visible but are labeled **EXTENDED**. Viewer and holder counts remain visible but do not influence the similarity rank.
 
-Open **Early-runner filters** to adjust the market-cap, age, momentum, turnover, trade-count, and buy/sell requirements. Turn off **Ungraduated only** to include graduated tokens with at least $8K liquidity and a 15% liquidity-to-market-cap ratio.
+Open **Early-runner filters** to adjust the inclusive 1–1,000 holder-count window plus the market-cap, age, momentum, turnover, trade-count, and buy/sell requirements. Tokens with an unavailable holder count are excluded from this profile rather than treated as zero. Turn off **Ungraduated only** to include graduated tokens with at least $8K liquidity and a 15% liquidity-to-market-cap ratio.
 
 The **BOT trades** profile is modeled on the launch behavior of `ufteZkSALGhT9NwE34UHNUyxinJGgAFLMmmtfZepump`. It looks for graduated tokens with at least 200 trades in five minutes, at least 80% buys, and a fresh raw-trade sample showing a micro-buy swarm and wallet-dollar concentration. Its default raw thresholds are 40 trades and at least 30 buys in the current minute, at least 80% buys, a median buy no larger than $0.25, at least 50% of buys below $0.10, and at least 50% of buy dollars from the top wallet. Raw sampling is limited to the ten busiest aggregate matches per sweep so the one-minute schedule remains responsive.
 
-**BOT trades is a manipulation-risk warning, not a buy profile.** Aggregate counts can suggest automation but cannot prove who controls a wallet; candidates without a fresh raw sample are labeled **AGGREGATE ONLY**. **Aggressive**, **Top movers**, **Live now**, and **Risk-first** remain available and keep their existing behavior. **Live now** ranks indexed active livestreams by their current Pump.fun viewer count.
+**BOT trades is a manipulation-risk warning, not a buy profile.** Aggregate counts can suggest automation but cannot prove who controls a wallet; candidates without a fresh raw sample are labeled **AGGREGATE ONLY**. **Aggressive**, **Top movers**, **Live now**, and **Risk-first** remain available and keep their existing behavior. Every ranking table shows Pump.fun's holder count; a blank is unknown, not zero. **Live now** ranks indexed active livestreams by their current Pump.fun viewer count.
 
-The quick sweep is a discovery filter, not an entry signal. Holder, sniper, bundler, and concentration data may still require a deep scan or independent verification.
+Holder totals come from Pump.fun's indexed count and are cached for one minute to keep automatic sweeps responsive. The quick sweep is a discovery filter, not an entry signal. Sniper, bundler, and concentration data may still require a deep scan or independent verification.
 
 A decision-support dashboard for Solana Pump.fun tokens.
 
@@ -33,7 +33,7 @@ The app opens at `http://localhost:8502`.
 ## What it does
 
 - Screens a Solana mint using Pump metadata, DEX Screener market data, and Solana RPC.
-- Shows token age and the current Pump.fun viewer count for active livestreams.
+- Shows token age, Pump.fun holder count, and the current viewer count for active livestreams.
 - Applies configurable age, liquidity, concentration, creator, bundler, and momentum limits.
 - Maintains a watchlist and ranks candidates.
 - Tracks positions entered by the user.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ import json
 import math
 import re
 from statistics import median
+from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import Any
 
@@ -47,6 +49,9 @@ PUMP_DISCOVERY_BOARD = (
     "https://advanced-indexer.pump.fun/boards/{board}"
     "?tier=web&surface=WEB&platform=WEB&limit={limit}"
 )
+PUMP_HOLDER_COUNT = (
+    "https://frontend-api-v3.pump.fun/token-holders/{mint}/count"
+)
 PUMP_SWAP_TRADES = "https://swap-api.pump.fun/v2/coins/{mint}/trades?limit={limit}"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -61,6 +66,18 @@ _LIVESTREAM_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _LIVESTREAM_TTL_SECONDS = 30.0
 _LIVESTREAM_FAILURE_TTL_SECONDS = 8.0
 _MAX_VIEWER_LOOKUPS_PER_SWEEP = 30
+_HOLDER_COUNT_CACHE: dict[str, tuple[float, int | None]] = {}
+_HOLDER_COUNT_TTL_SECONDS = 60.0
+_HOLDER_COUNT_FAILURE_TTL_SECONDS = 60.0
+_MAX_HOLDER_LOOKUPS_PER_SWEEP = 50
+_HOLDER_COUNT_CACHE_LOCK = Lock()
+_HOLDER_COUNT_COOLDOWN_UNTIL = 0.0
+_HOLDER_COUNT_REQUEST_WINDOW_SECONDS = 60.0
+_HOLDER_COUNT_MAX_DISCOVERY_REQUESTS = 50
+_HOLDER_COUNT_MAX_TOTAL_REQUESTS = 58
+_HOLDER_COUNT_REQUESTS: deque[tuple[float, str]] = deque()
+_HOLDER_COUNT_INFLIGHT: dict[str, Event] = {}
+_HOLDER_COUNT_REQUEST_SLOTS = BoundedSemaphore(5)
 
 
 @dataclass
@@ -205,6 +222,190 @@ def _extract_int(value: Any) -> int | None:
 def _first_present(*values: Any) -> Any:
     """Return the first non-None value while preserving legitimate numeric zeroes."""
     return next((value for value in values if value is not None), None)
+
+
+def _holder_count_from_payload(payload: Any) -> int | None:
+    """Normalize Pump and indexed holder-count shapes without treating missing as zero."""
+    if not isinstance(payload, dict):
+        return None
+    holders = payload.get("holders") if isinstance(payload.get("holders"), dict) else {}
+    for value in (
+        payload.get("holder_count"),
+        payload.get("holderCount"),
+        payload.get("num_holders"),
+        payload.get("numHolders"),
+        holders.get("count"),
+    ):
+        if isinstance(value, bool):
+            continue
+        parsed = _extract_int(value)
+        if parsed is not None and parsed >= 0:
+            return parsed
+    return None
+
+
+def _pump_holder_count(mint: str, *, request_kind: str = "deep") -> int | None:
+    """Read Pump's holder total with caching, single-flight, and a shared quota."""
+    global _HOLDER_COUNT_COOLDOWN_UNTIL
+
+    now = time.monotonic()
+    lookup_done = Event()
+    with _HOLDER_COUNT_CACHE_LOCK:
+        cached = _HOLDER_COUNT_CACHE.get(mint)
+        if cached:
+            ttl = (
+                _HOLDER_COUNT_TTL_SECONDS
+                if cached[1] is not None
+                else _HOLDER_COUNT_FAILURE_TTL_SECONDS
+            )
+            if now - cached[0] < ttl:
+                return cached[1]
+        if now < _HOLDER_COUNT_COOLDOWN_UNTIL:
+            return None
+        in_flight = _HOLDER_COUNT_INFLIGHT.get(mint)
+        if in_flight is None:
+            _HOLDER_COUNT_INFLIGHT[mint] = lookup_done
+
+    # If another Streamlit session is already fetching this mint, reuse its
+    # result instead of spending a second request from Pump's one-minute quota.
+    if in_flight is not None:
+        in_flight.wait(timeout=9.0)
+        with _HOLDER_COUNT_CACHE_LOCK:
+            completed = _HOLDER_COUNT_CACHE.get(mint)
+        return completed[1] if completed is not None else None
+
+    with _HOLDER_COUNT_CACHE_LOCK:
+        while (
+            _HOLDER_COUNT_REQUESTS
+            and now - _HOLDER_COUNT_REQUESTS[0][0]
+            >= _HOLDER_COUNT_REQUEST_WINDOW_SECONDS
+        ):
+            _HOLDER_COUNT_REQUESTS.popleft()
+        discovery_requests = sum(
+            kind == "discovery" for _, kind in _HOLDER_COUNT_REQUESTS
+        )
+        quota_available = (
+            len(_HOLDER_COUNT_REQUESTS) < _HOLDER_COUNT_MAX_TOTAL_REQUESTS
+            and (
+                request_kind != "discovery"
+                or discovery_requests < _HOLDER_COUNT_MAX_DISCOVERY_REQUESTS
+            )
+        )
+        if quota_available:
+            _HOLDER_COUNT_REQUESTS.append((now, request_kind))
+        else:
+            _HOLDER_COUNT_INFLIGHT.pop(mint, None)
+            lookup_done.set()
+
+    if not quota_available:
+        return None
+
+    count: int | None = None
+    try:
+        with _HOLDER_COUNT_REQUEST_SLOTS:
+            with _HOLDER_COUNT_CACHE_LOCK:
+                source_available = time.monotonic() >= _HOLDER_COUNT_COOLDOWN_UNTIL
+            if source_available:
+                response = requests.get(
+                    PUMP_HOLDER_COUNT.format(mint=mint),
+                    timeout=7,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36"
+                        ),
+                        "Accept": "application/json",
+                        "Origin": "https://pump.fun",
+                        "Referer": f"https://pump.fun/coin/{mint}",
+                    },
+                )
+                response.raise_for_status()
+                count = _holder_count_from_payload(response.json())
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = getattr(response, "status_code", None)
+        cooldown_seconds = 0.0
+        if status == 429:
+            cooldown_seconds = 60.0
+            for header in ("Retry-After", "x-ratelimit-reset"):
+                try:
+                    value = float(response.headers.get(header, 0))
+                except (TypeError, ValueError):
+                    continue
+                if value > 1_000_000_000:
+                    value = max(0.0, value - time.time())
+                cooldown_seconds = max(cooldown_seconds, value)
+        elif status in {401, 403}:
+            cooldown_seconds = 300.0
+        elif status is not None and status >= 500:
+            cooldown_seconds = 60.0
+        if cooldown_seconds:
+            with _HOLDER_COUNT_CACHE_LOCK:
+                _HOLDER_COUNT_COOLDOWN_UNTIL = max(
+                    _HOLDER_COUNT_COOLDOWN_UNTIL,
+                    time.monotonic() + min(cooldown_seconds, 600.0),
+                )
+    except requests.RequestException:
+        with _HOLDER_COUNT_CACHE_LOCK:
+            _HOLDER_COUNT_COOLDOWN_UNTIL = max(
+                _HOLDER_COUNT_COOLDOWN_UNTIL,
+                time.monotonic() + 60.0,
+            )
+    except ValueError:
+        pass
+    finally:
+        completed_at = time.monotonic()
+        with _HOLDER_COUNT_CACHE_LOCK:
+            if len(_HOLDER_COUNT_CACHE) >= 2_000:
+                expired = [
+                    key
+                    for key, (cached_at, _) in _HOLDER_COUNT_CACHE.items()
+                    if completed_at - cached_at >= _HOLDER_COUNT_TTL_SECONDS
+                ]
+                for key in expired:
+                    _HOLDER_COUNT_CACHE.pop(key, None)
+                if len(_HOLDER_COUNT_CACHE) >= 2_000:
+                    oldest = min(
+                        _HOLDER_COUNT_CACHE,
+                        key=lambda key: _HOLDER_COUNT_CACHE[key][0],
+                    )
+                    _HOLDER_COUNT_CACHE.pop(oldest, None)
+            _HOLDER_COUNT_CACHE[mint] = (completed_at, count)
+            event = _HOLDER_COUNT_INFLIGHT.pop(mint, None)
+            if event is not None:
+                event.set()
+    return count
+
+
+def _enrich_pump_holder_counts(
+    coins: list[dict[str, Any]],
+    *,
+    max_lookups: int = _MAX_HOLDER_LOOKUPS_PER_SWEEP,
+) -> list[dict[str, Any]]:
+    """Attach Pump's displayed holder total to each quick-discovery row."""
+    enriched = [dict(coin) for coin in coins]
+    targets = [
+        coin
+        for coin in enriched
+        if coin.get("mint") and _holder_count_from_payload(coin) is None
+    ][:max_lookups]
+    if targets:
+        with ThreadPoolExecutor(max_workers=min(5, len(targets))) as executor:
+            counts = executor.map(
+                lambda mint: _pump_holder_count(mint, request_kind="discovery"),
+                [str(coin["mint"]) for coin in targets],
+            )
+            for coin, count in zip(targets, counts):
+                if count is not None:
+                    coin["holder_count"] = count
+
+    # Preserve holder fields supplied by any upstream feed under the canonical key.
+    for coin in enriched:
+        count = _holder_count_from_payload(coin)
+        if count is not None:
+            coin["holder_count"] = count
+    return enriched
 
 
 def analyze_bot_trades(mint: str, limit: int = 100) -> dict[str, Any]:
@@ -759,7 +960,7 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
     sort_by = sort_by if sort_by in {"created_timestamp", "last_trade_timestamp"} else "created_timestamp"
     recent = _gecko_discovery(limit, sort_by)
     if recent:
-        return _enrich_pump_viewer_counts(recent)
+        return _enrich_pump_holder_counts(_enrich_pump_viewer_counts(recent))
 
     board = "movers" if sort_by == "last_trade_timestamp" else "new"
     sources = (
@@ -806,7 +1007,7 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
     if not live_by_mint:
         recent = _enrich_pump_viewer_counts(recent)
 
-    return recent
+    return _enrich_pump_holder_counts(recent)
 
 
 def discover_live_mints(limit: int = 20) -> list[dict[str, Any]]:
@@ -831,7 +1032,7 @@ def discover_live_mints(limit: int = 20) -> list[dict[str, Any]]:
         ) or 0,
         reverse=True,
     )
-    return [dict(coin) for coin in live[:limit]]
+    return _enrich_pump_holder_counts([dict(coin) for coin in live[:limit]])
 
 
 def scan_token(
@@ -866,6 +1067,11 @@ def scan_token(
             pairs = []
     pair = _best_pair(pairs if isinstance(pairs, list) else [])
     manual = manual or {}
+    holder_count = manual.get("holder_count")
+    if holder_count is None:
+        holder_count = _holder_count_from_payload(coin)
+    if holder_count is None and include_onchain:
+        holder_count = _pump_holder_count(mint)
 
     created_ms = coin.get("created_timestamp")
     pair_created_ms = pair.get("pairCreatedAt") if pair else None
@@ -916,7 +1122,7 @@ def scan_token(
             if manual.get("creator_percent") is not None
             else (_creator_percent(mint, coin.get("creator")) if include_onchain else None)
         ),
-        holder_count=manual.get("holder_count"),
+        holder_count=_extract_int(holder_count),
         sniper_percent=manual.get("sniper_percent"),
         bundler_percent=manual.get("bundler_percent"),
         complete=bool(coin.get("complete") or (pair or {}).get("dexId") == "pumpswap"),

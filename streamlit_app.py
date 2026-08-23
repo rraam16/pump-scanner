@@ -75,9 +75,13 @@ def cached_live_mints(limit: int) -> list[dict]:
 
 @st.cache_data(ttl="30s", max_entries=150, show_spinner=False)
 def cached_quick_scan(coin_payload: dict, rules_payload: dict) -> dict:
+    quick_rules = Rules(**rules_payload)
+    # Discovery profiles either show holders for context or apply their own
+    # explicit range. The sidebar minimum remains a deep-scan guardrail.
+    quick_rules.minimum_holder_count = 0
     result = scan_token(
         coin_payload["mint"],
-        Rules(**rules_payload),
+        quick_rules,
         coin_data=coin_payload,
         include_onchain=False,
     )
@@ -477,7 +481,14 @@ with st.sidebar:
     maximum_creator = st.number_input("Maximum creator (%)", 0.0, 100.0, 10.0, 1.0)
     maximum_bundler = st.number_input("Maximum bundlers (%)", 0.0, 100.0, 5.0, 1.0)
     maximum_5m = st.number_input("Maximum five-minute rise (%)", 0.0, 10_000.0, 35.0, 5.0)
-    minimum_holders = st.number_input("Minimum holders", 0, 1_000_000, 100, 25)
+    minimum_holders = st.number_input(
+        "Deep-scan minimum holders",
+        0,
+        1_000_000,
+        100,
+        25,
+        help="Applies to Deep scan, Watchlist, and Positions. Early runners has its own holder window.",
+    )
     reject_modes = st.pills(
         "Reject detected launch modes",
         ["BOOST", "Mayhem"],
@@ -514,8 +525,8 @@ if discover_tab.open:
     with discover_tab:
         st.markdown("## Token discovery")
         st.caption(
-            "Scan fresh launches, top movers, or active Pump livestreams. The quick pass avoids slow holder RPC calls; "
-            "run a deep scan before treating any candidate as entry-eligible."
+            "Scan fresh launches, top movers, or active Pump livestreams. The quick pass uses Pump's "
+            "indexed holder total; run a deep scan for concentration checks before treating any candidate as entry-eligible."
         )
         scan_profile = st.segmented_control(
             "Ranking profile",
@@ -536,6 +547,8 @@ if discover_tab.open:
             "minimum_turnover": 0.12,
             "minimum_buy_ratio": 1.40,
             "minimum_trades": 25.0,
+            "minimum_holders": 1.0,
+            "maximum_holders": 1_000.0,
         }
         bot_settings = {
             "minimum_market_cap": 5_000.0,
@@ -633,6 +646,15 @@ if discover_tab.open:
                     1.0,
                     key="early_momentum_range_v2",
                 )
+                holder_range = st.slider(
+                    "Holder-count window",
+                    1,
+                    1_000,
+                    (1, 1_000),
+                    1,
+                    key="early_holder_range_v1",
+                    help="Inclusive Pump.fun holder count. Tokens with an unavailable count are excluded.",
+                )
                 filter_cols = st.columns(4)
                 with filter_cols[0]:
                     early_minimum_volume = st.number_input(
@@ -675,6 +697,8 @@ if discover_tab.open:
                     "minimum_turnover": float(early_minimum_turnover),
                     "minimum_buy_ratio": float(early_minimum_buy_ratio),
                     "minimum_trades": float(early_minimum_trades),
+                    "minimum_holders": float(holder_range[0]),
+                    "maximum_holders": float(holder_range[1]),
                 })
 
         if scan_profile == "BOT trades":
@@ -828,6 +852,10 @@ if discover_tab.open:
             missing_early_data_count = 0
             missing_bot_aggregate_count = 0
             missing_bot_sample_count = 0
+            holder_count = pd.to_numeric(
+                discovery_df["holder_count"], errors="coerce"
+            ).replace([float("inf"), float("-inf")], float("nan"))
+            missing_holder_count = int(holder_count.isna().sum())
             if scan_profile == "Early runners":
                 early_metrics = pd.DataFrame([
                     early_runner_metrics(row, early_settings)
@@ -883,6 +911,10 @@ if discover_tab.open:
                     & (turnover >= early_settings["minimum_turnover"])
                     & (trade_count >= early_settings["minimum_trades"])
                     & (buy_ratio >= early_settings["minimum_buy_ratio"])
+                    & holder_count.between(
+                        early_settings["minimum_holders"],
+                        early_settings["maximum_holders"],
+                    )
                     & discovery_df["early_score"].notna()
                 )
                 if rules.reject_boost:
@@ -1014,7 +1046,13 @@ if discover_tab.open:
                         st.metric("Mints scanned", mints_scanned_count, border=True)
                         st.metric("Matches", 0, border=True)
                         st.metric("Missing recent data", missing_early_data_count, border=True)
-                    if missing_early_data_count == mints_scanned_count:
+                        st.metric("Missing holders", missing_holder_count, border=True)
+                    if missing_holder_count == mints_scanned_count:
+                        st.info(
+                            "Pump.fun did not return holder totals for this sweep, so the holder "
+                            "filter could not rank any tokens. Try another sweep shortly."
+                        )
+                    elif missing_early_data_count == mints_scanned_count:
                         st.info(
                             "None of the scanned tokens had enough five-minute market and order-flow "
                             "data to rank. Try another sweep in a minute."
@@ -1022,7 +1060,7 @@ if discover_tab.open:
                     else:
                         st.info(
                             "No tokens matched every early-runner filter in this sweep. "
-                            "Widen the cap or momentum window, or lower the turnover/order-flow minimums."
+                            "Widen the holder, cap, or momentum window, or lower the turnover/order-flow minimums."
                         )
                 elif scan_profile == "BOT trades":
                     with st.container(horizontal=True):
@@ -1042,6 +1080,9 @@ if discover_tab.open:
                 else:
                     st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
+            ranked_missing_holder_count = int(
+                pd.to_numeric(discovery_df["holder_count"], errors="coerce").isna().sum()
+            )
             if scan_profile == "Early runners":
                 rank_columns = [
                     "early_signal", "early_score", "buy_share_pct", "volume_to_cap", "trade_count"
@@ -1057,7 +1098,7 @@ if discover_tab.open:
             else:
                 rank_columns = []
             display_columns = [
-                "symbol", "verdict", *rank_columns, "score", "market_cap_usd", "liquidity_usd",
+                "symbol", "holder_count", "verdict", *rank_columns, "score", "market_cap_usd", "liquidity_usd",
                 "price_change_5m", "price_change_1h", "volume_5m", "volume_1h", "volume_24h", "age", "live_viewers",
                 "complete", "mint",
             ]
@@ -1072,6 +1113,9 @@ if discover_tab.open:
                     discovery_df[column] = None
             discovery_df["live_viewers"] = pd.to_numeric(
                 discovery_df["live_viewers"], errors="coerce"
+            )
+            discovery_df["holder_count"] = pd.to_numeric(
+                discovery_df["holder_count"], errors="coerce"
             )
             discovery_df = discovery_df[display_columns]
 
@@ -1095,6 +1139,16 @@ if discover_tab.open:
                     f"{missing_early_data_count} scanned token(s) were skipped because recent "
                     "market or five-minute order-flow data was unavailable."
                 )
+            if scan_profile == "Early runners" and missing_holder_count:
+                st.caption(
+                    f"{missing_holder_count} scanned token(s) had no Pump.fun holder total and were "
+                    "excluded from the holder-count filter. Missing is unknown, not zero."
+                )
+            if scan_profile != "Early runners" and ranked_missing_holder_count:
+                st.caption(
+                    f"{ranked_missing_holder_count} ranked token(s) have no Pump.fun holder total. "
+                    "Blank holder counts are unknown, not zero."
+                )
             if scan_profile == "BOT trades" and missing_bot_aggregate_count:
                 st.caption(
                     f"{missing_bot_aggregate_count} scanned token(s) were skipped because complete "
@@ -1112,6 +1166,11 @@ if discover_tab.open:
                 key="discovery_table",
                 column_config={
                     "symbol": st.column_config.TextColumn("Token", pinned=True),
+                    "holder_count": st.column_config.NumberColumn(
+                        "Holders",
+                        format="%d",
+                        help="Pump.fun holder count; blank means the count is temporarily unavailable.",
+                    ),
                     "verdict": st.column_config.TextColumn("Quick decision"),
                     "early_signal": st.column_config.TextColumn("Similarity"),
                     "early_score": st.column_config.ProgressColumn(
@@ -1218,7 +1277,12 @@ if scan_tab.open:
         st.markdown("**Optional Pump audit overrides**")
         manual_cols = st.columns(5)
         with manual_cols[0]:
-            holder_count = st.number_input("Holders", min_value=0, value=0, help="Enter 0 to leave unknown")
+            holder_count = st.number_input(
+                "Holders",
+                min_value=0,
+                value=0,
+                help="Enter 0 to use Pump.fun's indexed holder count.",
+            )
         with manual_cols[1]:
             top10 = st.number_input("Top 10 (%)", 0.0, 100.0, 0.0, help="Enter 0 to use the conservative RPC estimate")
         with manual_cols[2]:
@@ -1255,6 +1319,12 @@ if scan_tab.open:
                 st.metric("Liquidity", money(result.liquidity_usd), border=True)
                 st.metric("5-minute move", percent(result.price_change_5m), border=True)
                 st.metric("Token age", age_label(result.age_minutes), border=True)
+                st.metric(
+                    "Holders",
+                    f"{result.holder_count:,}" if result.holder_count is not None else "Unavailable",
+                    border=True,
+                    help="Holder total reported by Pump.fun, unless manually overridden.",
+                )
                 st.metric(
                     "Pump.fun viewer count",
                     pump_viewer_count_label(result.is_currently_live, result.live_viewers),
@@ -1299,7 +1369,7 @@ if watch_tab.open:
     if rows:
         watch_df = pd.DataFrame(rows)
         display_columns = [
-            "symbol", "verdict", "score", "market_cap_usd", "liquidity_usd",
+            "symbol", "holder_count", "verdict", "score", "market_cap_usd", "liquidity_usd",
             "price_change_5m", "price_change_1h", "volume_24h", "age", "live_viewers",
             "mint",
         ]
@@ -1310,12 +1380,20 @@ if watch_tab.open:
         watch_df["live_viewers"] = pd.to_numeric(
             watch_df["live_viewers"], errors="coerce"
         )
+        watch_df["holder_count"] = pd.to_numeric(
+            watch_df["holder_count"], errors="coerce"
+        )
         watch_df = watch_df[display_columns].sort_values("score", ascending=False)
         st.dataframe(
             watch_df,
             hide_index=True,
             column_config={
                 "symbol": st.column_config.TextColumn("Token", pinned=True),
+                "holder_count": st.column_config.NumberColumn(
+                    "Holders",
+                    format="%d",
+                    help="Pump.fun holder count; blank means the count is temporarily unavailable.",
+                ),
                 "verdict": st.column_config.TextColumn("Decision"),
                 "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100),
                 "market_cap_usd": st.column_config.NumberColumn("Market cap", format="$%.0f"),
