@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import json
 import re
 import time
 from typing import Any
@@ -30,7 +31,8 @@ PUMP_CURRENTLY_LIVE = (
     "?offset=0&limit=1000&includeNsfw=false"
 )
 PUMP_LIVESTREAM = "https://livestream-api.pump.fun/livestream?mintId={mint}"
-PUMP_COIN_PAGE = "https://pump.fun/coin/{mint}"
+PUMP_LIVE_PAGE_RSC = "https://pump.fun/live?_rsc=pumpscanner"
+PUMP_COIN_PAGE_RSC = "https://pump.fun/coin/{mint}?_rsc=pumpscanner"
 PUMP_RECENT_SEARCH = (
     "https://frontend-api-v3.pump.fun/coins/search-unrestricted"
     "?offset=0&limit={limit}&sort={sort_by}&order=desc&includeNsfw=false"
@@ -48,8 +50,12 @@ SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 _LIVE_ROSTER_CACHE: dict[str, dict[str, Any]] = {}
 _LIVE_ROSTER_CACHED_AT = 0.0
 _LIVE_ROSTER_TTL_SECONDS = 15.0
+_LIVE_PAGE_CACHE: dict[str, dict[str, Any]] = {}
+_LIVE_PAGE_CACHED_AT = 0.0
+_LIVE_PAGE_TTL_SECONDS = 25.0
 _LIVESTREAM_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
-_LIVESTREAM_TTL_SECONDS = 60.0
+_LIVESTREAM_TTL_SECONDS = 30.0
+_LIVESTREAM_FAILURE_TTL_SECONDS = 8.0
 _MAX_VIEWER_LOOKUPS_PER_SWEEP = 30
 
 
@@ -115,13 +121,19 @@ def _get_json(url: str, *, timeout: int = 15) -> Any:
     return response.json()
 
 
-def _get_text(url: str, *, timeout: int = 15) -> str:
+def _get_pump_rsc(url: str, path: str, *, timeout: int = 12) -> str:
     response = requests.get(
         url,
         timeout=timeout,
         headers={
-            "User-Agent": "PumpScanner/1.0",
-            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/x-component",
+            "RSC": "1",
+            "Next-Url": path,
         },
     )
     response.raise_for_status()
@@ -193,6 +205,8 @@ def _live_viewers(coin: dict[str, Any]) -> int | None:
         coin.get("livestream_viewer_count"),
         coin.get("num_participants"),
         coin.get("numParticipants"),
+        coin.get("viewerCount"),
+        coin.get("livestream_num_participants"),
         livestream.get("viewer_count"),
         livestream.get("viewers"),
         livestream.get("current_viewers"),
@@ -213,16 +227,90 @@ def _is_live(coin: dict[str, Any]) -> bool:
     )
 
 
+def _flight_objects(text: str, key: str, *, lookback: int = 8_000):
+    """Yield JSON objects containing a key from a Next.js Flight response."""
+    decoder = json.JSONDecoder()
+    seen: set[tuple[int, int]] = set()
+    for hit in re.finditer(rf'"{re.escape(key)}"\s*:', text):
+        lower_bound = max(0, hit.start() - lookback)
+        starts = [
+            match.start() + lower_bound
+            for match in re.finditer(r"\{", text[lower_bound:hit.start()])
+        ]
+        for start in reversed(starts):
+            try:
+                value, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                continue
+            if end < hit.end() or not isinstance(value, dict) or key not in value:
+                continue
+            if (start, end) not in seen:
+                seen.add((start, end))
+                yield value
+            break
+
+
+def _live_page_roster() -> dict[str, dict[str, Any]] | None:
+    """Read Pump's same-origin live page when the frontend API rejects cloud IPs."""
+    global _LIVE_PAGE_CACHE, _LIVE_PAGE_CACHED_AT
+
+    now = time.monotonic()
+    if _LIVE_PAGE_CACHED_AT and now - _LIVE_PAGE_CACHED_AT < _LIVE_PAGE_TTL_SECONDS:
+        return {mint: dict(coin) for mint, coin in _LIVE_PAGE_CACHE.items()}
+
+    try:
+        payload = _get_pump_rsc(PUMP_LIVE_PAGE_RSC, "/live")
+    except requests.RequestException:
+        return (
+            {mint: dict(coin) for mint, coin in _LIVE_PAGE_CACHE.items()}
+            if _LIVE_PAGE_CACHE else None
+        )
+
+    roster: dict[str, dict[str, Any]] = {}
+    for item in _flight_objects(payload, "viewerCount"):
+        mint = item.get("mint")
+        viewers = item.get("viewerCount")
+        if (
+            item.get("isLive") is True
+            and isinstance(mint, str)
+            and isinstance(viewers, int)
+            and viewers >= 0
+        ):
+            roster[mint] = {
+                **item,
+                "mint": mint,
+                "is_currently_live": True,
+                "num_participants": viewers,
+            }
+
+    # A malformed/blocked response must not erase the last known good roster.
+    if not roster:
+        return (
+            {mint: dict(coin) for mint, coin in _LIVE_PAGE_CACHE.items()}
+            if _LIVE_PAGE_CACHE else None
+        )
+
+    _LIVE_PAGE_CACHE = roster
+    _LIVE_PAGE_CACHED_AT = now
+    return {mint: dict(coin) for mint, coin in roster.items()}
+
+
 def _live_roster() -> dict[str, dict[str, Any]]:
     """Return Pump's active livestream roster, briefly cached across scans."""
     global _LIVE_ROSTER_CACHE, _LIVE_ROSTER_CACHED_AT
 
     now = time.monotonic()
-    if _LIVE_ROSTER_CACHE and now - _LIVE_ROSTER_CACHED_AT < _LIVE_ROSTER_TTL_SECONDS:
+    if _LIVE_ROSTER_CACHED_AT and now - _LIVE_ROSTER_CACHED_AT < _LIVE_ROSTER_TTL_SECONDS:
         return _LIVE_ROSTER_CACHE
 
     roster: dict[str, dict[str, Any]] = {}
     successful_lookup = False
+
+    live_page = _live_page_roster()
+    if live_page is not None:
+        _LIVE_ROSTER_CACHE = live_page
+        _LIVE_ROSTER_CACHED_AT = now
+        return live_page
 
     # The broad roster currently contains more live rooms. Pump's sorted live
     # search is fetched second so its displayed participant count wins when a
@@ -235,11 +323,11 @@ def _live_roster() -> dict[str, dict[str, Any]]:
         if not isinstance(payload, list):
             continue
         successful_lookup = True
-        roster.update({
-            coin["mint"]: coin
-            for coin in payload
-            if isinstance(coin, dict) and coin.get("mint") and _is_live(coin)
-        })
+        for coin in payload:
+            if not isinstance(coin, dict) or not coin.get("mint") or not _is_live(coin):
+                continue
+            mint = str(coin["mint"])
+            roster[mint] = coin
 
     if successful_lookup:
         _LIVE_ROSTER_CACHE = roster
@@ -251,30 +339,24 @@ def _live_roster() -> dict[str, dict[str, Any]]:
 
 def _livestream_status_from_coin_page(mint: str) -> dict[str, Any] | None:
     """Read Pump's server-rendered live status when its JSON host is blocked."""
+    path = f"/coin/{mint}"
     try:
-        page = _get_text(PUMP_COIN_PAGE.format(mint=mint), timeout=10)
+        page = _get_pump_rsc(
+            PUMP_COIN_PAGE_RSC.format(mint=mint),
+            path,
+        )
     except requests.RequestException:
         return None
 
-    # Pump embeds the current livestream object in its Next.js page data. The
-    # JSON quotes are escaped inside a script tag, so normalize them before
-    # locating the object for this exact mint. Keeping the search mint-scoped
-    # prevents a previous-stream count elsewhere on the page from being used.
-    normalized = page.replace('\\"', '"')
-    marker = re.compile(rf'"mintId"\s*:\s*"{re.escape(mint)}"')
-    for match in marker.finditer(normalized):
-        window = normalized[match.start():match.start() + 3_000]
-        live_match = re.search(r'"isLive"\s*:\s*(true|false)', window, re.IGNORECASE)
-        if not live_match:
-            continue
-        count_match = re.search(r'"numParticipants"\s*:\s*(\d+)', window)
-        status: dict[str, Any] = {
-            "mintId": mint,
-            "isLive": live_match.group(1).lower() == "true",
-        }
-        if count_match:
-            status["numParticipants"] = int(count_match.group(1))
-        return status
+    for item in _flight_objects(page, "numParticipants"):
+        viewers = item.get("numParticipants")
+        if (
+            item.get("mintId") == mint
+            and item.get("isLive") is True
+            and isinstance(viewers, int)
+            and viewers >= 0
+        ):
+            return {**item, "numParticipants": viewers}
     return None
 
 
@@ -282,8 +364,14 @@ def _livestream_status(mint: str) -> dict[str, Any] | None:
     """Read Pump's per-mint livestream status with a rate-friendly cache."""
     now = time.monotonic()
     cached = _LIVESTREAM_CACHE.get(mint)
-    if cached and now - cached[0] < _LIVESTREAM_TTL_SECONDS:
-        return dict(cached[1]) if cached[1] is not None else None
+    if cached:
+        cache_ttl = (
+            _LIVESTREAM_TTL_SECONDS
+            if cached[1] is not None
+            else _LIVESTREAM_FAILURE_TTL_SECONDS
+        )
+        if now - cached[0] < cache_ttl:
+            return dict(cached[1]) if cached[1] is not None else None
 
     api_failed = False
     try:
@@ -326,6 +414,22 @@ def _enrich_pump_viewer_counts(
 ) -> list[dict[str, Any]]:
     """Attach Pump's exact active viewer count without exceeding a sweep budget."""
     enriched = [dict(coin) for coin in coins]
+    live_by_mint = _live_roster()
+    for coin in enriched:
+        mint = str(coin.get("mint") or "")
+        live_coin = live_by_mint.get(mint)
+        if not live_coin:
+            continue
+        coin["is_currently_live"] = True
+        viewers = _live_viewers(live_coin)
+        if viewers is not None:
+            coin["num_participants"] = viewers
+
+    # When Pump's same-origin live page loaded, it already supplied the exact
+    # active-room counts in one request. Avoid dozens of per-token fallbacks.
+    if live_by_mint:
+        return enriched
+
     targets = [
         coin
         for coin in enriched
@@ -570,7 +674,9 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
         live_coin = live_by_mint.get(coin["mint"])
         if live_coin:
             coin["is_currently_live"] = True
-            coin["num_participants"] = live_coin.get("num_participants")
+            viewers = _live_viewers(live_coin)
+            if viewers is not None:
+                coin["num_participants"] = viewers
 
     if not live_by_mint:
         recent = _enrich_pump_viewer_counts(recent)
