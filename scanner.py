@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import time
@@ -45,6 +46,9 @@ SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 _LIVE_ROSTER_CACHE: dict[str, dict[str, Any]] = {}
 _LIVE_ROSTER_CACHED_AT = 0.0
 _LIVE_ROSTER_TTL_SECONDS = 15.0
+_LIVESTREAM_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_LIVESTREAM_TTL_SECONDS = 60.0
+_MAX_VIEWER_LOOKUPS_PER_SWEEP = 30
 
 
 @dataclass
@@ -230,6 +234,62 @@ def _live_roster() -> dict[str, dict[str, Any]]:
     return _LIVE_ROSTER_CACHE
 
 
+def _livestream_status(mint: str) -> dict[str, Any] | None:
+    """Read Pump's per-mint livestream status with a rate-friendly cache."""
+    now = time.monotonic()
+    cached = _LIVESTREAM_CACHE.get(mint)
+    if cached and now - cached[0] < _LIVESTREAM_TTL_SECONDS:
+        return dict(cached[1]) if cached[1] is not None else None
+
+    try:
+        payload = _get_json(PUMP_LIVESTREAM.format(mint=mint), timeout=6)
+    except (requests.RequestException, ValueError):
+        payload = None
+    status = dict(payload) if isinstance(payload, dict) else None
+
+    if len(_LIVESTREAM_CACHE) >= 500:
+        expired = [
+            key
+            for key, (cached_at, _) in _LIVESTREAM_CACHE.items()
+            if now - cached_at >= _LIVESTREAM_TTL_SECONDS
+        ]
+        for key in expired:
+            _LIVESTREAM_CACHE.pop(key, None)
+        if len(_LIVESTREAM_CACHE) >= 500:
+            oldest = min(_LIVESTREAM_CACHE, key=lambda key: _LIVESTREAM_CACHE[key][0])
+            _LIVESTREAM_CACHE.pop(oldest, None)
+    _LIVESTREAM_CACHE[mint] = (now, status)
+    return dict(status) if status is not None else None
+
+
+def _enrich_pump_viewer_counts(
+    coins: list[dict[str, Any]],
+    *,
+    max_lookups: int = _MAX_VIEWER_LOOKUPS_PER_SWEEP,
+) -> list[dict[str, Any]]:
+    """Attach Pump's exact active viewer count without exceeding a sweep budget."""
+    enriched = [dict(coin) for coin in coins]
+    targets = [
+        coin
+        for coin in enriched
+        if coin.get("mint") and _live_viewers(coin) is None
+    ][:max_lookups]
+    if not targets:
+        return enriched
+
+    worker_count = min(8, len(targets))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        statuses = executor.map(
+            _livestream_status,
+            [str(coin["mint"]) for coin in targets],
+        )
+        for coin, status in zip(targets, statuses):
+            if status and _is_live(status):
+                coin["is_currently_live"] = True
+                coin["num_participants"] = status.get("numParticipants")
+    return enriched
+
+
 def _merge_live_status(coin: dict[str, Any], mint: str) -> dict[str, Any]:
     """Enrich a single coin with the same live count used by Pump's live page."""
     merged = dict(coin)
@@ -241,10 +301,7 @@ def _merge_live_status(coin: dict[str, Any], mint: str) -> dict[str, Any]:
 
     # Pump's per-mint service is useful when a just-started stream has not yet
     # appeared in the roster. It uses camelCase and may return an empty body.
-    try:
-        livestream = _get_json(PUMP_LIVESTREAM.format(mint=mint))
-    except (requests.RequestException, ValueError):
-        livestream = None
+    livestream = _livestream_status(mint)
     if isinstance(livestream, dict) and _is_live(livestream):
         merged["is_currently_live"] = True
         merged["num_participants"] = livestream.get("numParticipants")
@@ -414,7 +471,7 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
     sort_by = sort_by if sort_by in {"created_timestamp", "last_trade_timestamp"} else "created_timestamp"
     recent = _gecko_discovery(limit, sort_by)
     if recent:
-        return recent
+        return _enrich_pump_viewer_counts(recent)
 
     board = "movers" if sort_by == "last_trade_timestamp" else "new"
     sources = (
@@ -456,6 +513,9 @@ def discover_recent_mints(limit: int = 20, sort_by: str = "created_timestamp") -
             coin["is_currently_live"] = True
             coin["num_participants"] = live_coin.get("num_participants")
 
+    if not live_by_mint:
+        recent = _enrich_pump_viewer_counts(recent)
+
     return recent
 
 
@@ -464,7 +524,12 @@ def discover_live_mints(limit: int = 20) -> list[dict[str, Any]]:
     limit = max(5, min(int(limit), 50))
     live = list(_live_roster().values())
     if not live:
-        raise ScannerError("Live-stream discovery is temporarily unavailable.")
+        candidates = _enrich_pump_viewer_counts(
+            _gecko_discovery(max(30, limit), "last_trade_timestamp")
+        )
+        live = [coin for coin in candidates if _is_live(coin)]
+    if not live:
+        raise ScannerError("No indexed Pump.fun livestreams are active right now.")
     live.sort(
         key=lambda coin: _extract_int(
             coin.get("num_participants") or coin.get("numParticipants")
@@ -491,8 +556,8 @@ def scan_token(
     if coin_data is None:
         try:
             coin = _get_json(PUMP_COIN.format(mint=mint))
-        except requests.RequestException as exc:
-            raise ScannerError(f"Pump coin lookup failed: {exc}") from exc
+        except (requests.RequestException, ValueError):
+            coin = {"mint": mint}
         coin = _merge_live_status(coin, mint)
     else:
         coin = coin_data
@@ -545,7 +610,7 @@ def scan_token(
         holder_count=manual.get("holder_count"),
         sniper_percent=manual.get("sniper_percent"),
         bundler_percent=manual.get("bundler_percent"),
-        complete=bool(coin.get("complete")),
+        complete=bool(coin.get("complete") or (pair or {}).get("dexId") == "pumpswap"),
         boost_mode=_mode_is_active(coin.get("boost_mode")),
         mayhem_mode=_mode_is_active(coin.get("mayhem_mode") or coin.get("is_mayhem_mode")),
         website=coin.get("website"),
