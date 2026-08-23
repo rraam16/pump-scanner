@@ -363,7 +363,7 @@ if discover_tab.open:
             "minimum_age": 15.0,
             "maximum_age": 120.0,
             "minimum_momentum": 5.0,
-            "maximum_momentum": 80.0,
+            "maximum_momentum": 800.0,
             "minimum_volume": 1_000.0,
             "minimum_turnover": 0.12,
             "minimum_buy_ratio": 1.40,
@@ -437,9 +437,10 @@ if discover_tab.open:
                 momentum_range = st.slider(
                     "5-minute move window (%)",
                     -20.0,
-                    200.0,
-                    (5.0, 80.0),
+                    800.0,
+                    (5.0, 800.0),
                     1.0,
+                    key="early_momentum_range_v2",
                 )
                 filter_cols = st.columns(4)
                 with filter_cols[0]:

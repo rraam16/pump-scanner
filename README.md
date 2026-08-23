@@ -4,7 +4,7 @@ The **Discover** tab automatically pulls the newest non-NSFW Pump.fun mints and 
 
 Use **Automatic sweep** to refresh the discovery results every 1–15 minutes. The Discover view must remain open; choose **Off** to disable scheduled API activity.
 
-The default **Early runners** profile scans 50 actively traded mints every minute and looks for an entry-stage pattern: ungraduated tokens between $8K and $30K market cap, 15–120 minutes old, with +5% to +80% five-minute momentum, at least $1K of five-minute volume, five-minute turnover equal to at least 12% of market cap, 25+ recent trades, and at least 1.4 buys per sell. Its similarity rank favors the $10K–$20K range and combines market-cap fit, age, momentum, recent turnover, recent order flow, and activity. Viewer count remains visible but does not influence the rank.
+The default **Early runners** profile scans 50 actively traded mints every minute and looks for an entry-stage pattern: ungraduated tokens between $8K and $30K market cap, 15–120 minutes old, with +5% to +800% five-minute momentum, at least $1K of five-minute volume, five-minute turnover equal to at least 12% of market cap, 25+ recent trades, and at least 1.4 buys per sell. Its similarity rank favors the $10K–$20K range and combines market-cap fit, age, momentum, recent turnover, recent order flow, and activity. Moves above +65% remain visible but are labeled **EXTENDED**. Viewer count remains visible but does not influence the rank.
 
 Open **Early-runner filters** to adjust the market-cap, age, momentum, turnover, trade-count, and buy/sell requirements. Turn off **Ungraduated only** to include graduated tokens with at least $8K liquidity and a 15% liquidity-to-market-cap ratio.
 
