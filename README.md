@@ -8,7 +8,9 @@ The default **Early runners** profile scans 50 actively traded mints every minut
 
 Open **Early-runner filters** to adjust the market-cap, age, momentum, turnover, trade-count, and buy/sell requirements. Turn off **Ungraduated only** to include graduated tokens with at least $8K liquidity and a 15% liquidity-to-market-cap ratio.
 
-**Aggressive**, **Top movers**, **Live now**, and **Risk-first** remain available and keep their existing behavior. **Live now** ranks indexed active livestreams by their current Pump.fun viewer count.
+The **BOT trades** profile is modeled on the launch behavior of `ufteZkSALGhT9NwE34UHNUyxinJGgAFLMmmtfZepump`. It looks for graduated tokens with at least 200 trades in five minutes, at least 80% buys, and a fresh raw-trade sample showing a micro-buy swarm and wallet-dollar concentration. Its default raw thresholds are 40 trades in the latest minute, a median buy no larger than $0.25, at least 50% of buys below $0.10, and at least 50% of buy dollars from the top wallet. Raw sampling is limited to the ten busiest aggregate matches per sweep so the one-minute schedule remains responsive.
+
+**BOT trades is a manipulation-risk warning, not a buy profile.** Aggregate counts can suggest automation but cannot prove who controls a wallet; candidates without a fresh raw sample are labeled **AGGREGATE ONLY**. **Aggressive**, **Top movers**, **Live now**, and **Risk-first** remain available and keep their existing behavior. **Live now** ranks indexed active livestreams by their current Pump.fun viewer count.
 
 The quick sweep is a discovery filter, not an entry signal. Holder, sniper, bundler, and concentration data may still require a deep scan or independent verification.
 

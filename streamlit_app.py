@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import time
@@ -14,6 +15,7 @@ from scanner import (
     Rules,
     ScanResult,
     ScannerError,
+    analyze_bot_trades,
     discover_live_mints,
     discover_recent_mints,
     scan_token,
@@ -52,6 +54,7 @@ st.session_state.setdefault("watchlist", load_json(WATCHLIST_FILE, DEFAULT_WATCH
 st.session_state.setdefault("positions", load_json(POSITIONS_FILE, DEFAULT_POSITIONS))
 st.session_state.setdefault("last_scan", None)
 st.session_state.setdefault("last_auto_scan_at", 0.0)
+st.session_state.setdefault("last_auto_scan_at_by_profile", {})
 
 
 @st.cache_data(ttl="30s", max_entries=100, show_spinner=False)
@@ -81,21 +84,45 @@ def cached_quick_scan(coin_payload: dict, rules_payload: dict) -> dict:
     return result.to_dict()
 
 
+@st.cache_data(ttl="30s", max_entries=20, show_spinner=False)
+def cached_bot_trade_samples(mints: tuple[str, ...]) -> dict[str, dict]:
+    """Fetch raw trade samples only for the aggregate BOT-trades shortlist."""
+    if not mints:
+        return {}
+
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(mints))) as executor:
+        futures = {executor.submit(analyze_bot_trades, mint): mint for mint in mints}
+        for future in as_completed(futures):
+            mint = futures[future]
+            try:
+                results[mint] = future.result()
+            except (ScannerError, TypeError, ValueError) as exc:
+                results[mint] = {
+                    "bot_data_status": "UNAVAILABLE",
+                    "bot_data_error": str(exc),
+                }
+    return results
+
+
 @st.fragment(run_every="1m")
-def auto_scan_scheduler(interval_minutes: int) -> None:
+def auto_scan_scheduler(interval_minutes: int, profile_key: str) -> None:
     """Use a lightweight one-minute timer to trigger the selected sweep cadence."""
     if interval_minutes <= 0:
         st.caption(":gray-badge[Automatic sweep off]")
         return
 
     now = time.time()
-    last_run = float(st.session_state.last_auto_scan_at or 0.0)
+    timestamps = dict(st.session_state.last_auto_scan_at_by_profile)
+    last_run = float(timestamps.get(profile_key, 0.0) or 0.0)
     if last_run <= 0:
-        st.session_state.last_auto_scan_at = now
+        timestamps[profile_key] = now
+        st.session_state.last_auto_scan_at_by_profile = timestamps
         last_run = now
     remaining_seconds = interval_minutes * 60 - (now - last_run)
     if remaining_seconds <= 0:
-        st.session_state.last_auto_scan_at = now
+        timestamps[profile_key] = now
+        st.session_state.last_auto_scan_at_by_profile = timestamps
         st.rerun()
 
     remaining_minutes = max(1, int((remaining_seconds + 59) // 60))
@@ -291,6 +318,136 @@ def early_runner_metrics(row: dict[str, object], settings: dict[str, float]) -> 
     }
 
 
+def bot_trade_metrics(
+    row: dict[str, object],
+    settings: dict[str, float],
+    raw_sample: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Rank automation-like activity without claiming that a wallet is definitively a bot."""
+    market_cap = numeric_value(row.get("market_cap_usd"))
+    liquidity = numeric_value(row.get("liquidity_usd"))
+    age = numeric_value(row.get("age_minutes"))
+    volume_5m = numeric_value(row.get("volume_5m"))
+    buys_5m = numeric_value(row.get("buys_5m"))
+    sells_5m = numeric_value(row.get("sells_5m"))
+    buys_1h = numeric_value(row.get("buys_1h"))
+    sells_1h = numeric_value(row.get("sells_1h"))
+    required = (market_cap, age, volume_5m, buys_5m, sells_5m, buys_1h, sells_1h)
+    if any(value is None for value in required) or market_cap <= 0:
+        return {
+            "bot_score": None,
+            "bot_signal": "NEEDS DATA",
+            "bot_flags": "Missing aggregate market data",
+        }
+
+    trades_5m = buys_5m + sells_5m
+    trades_1h = buys_1h + sells_1h
+    if trades_5m <= 0 or trades_1h < trades_5m:
+        return {
+            "bot_score": None,
+            "bot_signal": "NEEDS DATA",
+            "bot_flags": "Inconsistent trade windows",
+        }
+
+    observed_minutes = max(5.0, min(age, 60.0))
+    trades_per_minute = trades_5m / 5.0
+    sustained_trades_per_minute = trades_1h / observed_minutes
+    buy_share = buys_5m / trades_5m
+    average_trade_usd = volume_5m / trades_5m
+    liquidity_to_cap = liquidity / market_cap if liquidity is not None else None
+
+    raw_sample = raw_sample or {}
+    raw_status = str(raw_sample.get("bot_data_status") or "UNAVAILABLE")
+    raw_trade_count = numeric_value(raw_sample.get("raw_trade_count_1m"))
+    median_buy = numeric_value(raw_sample.get("median_buy_usd"))
+    micro_share = numeric_value(raw_sample.get("micro_buy_share_pct"))
+    top_wallet_share = numeric_value(raw_sample.get("top_wallet_buy_share_pct"))
+    top3_share = numeric_value(raw_sample.get("top3_wallet_buy_share_pct"))
+
+    recent_rate_fit = min(1.0, trades_per_minute / 60.0)
+    sustained_rate_fit = min(1.0, sustained_trades_per_minute / 50.0)
+    buy_direction_fit = max(0.0, min(1.0, (buy_share - 0.50) / 0.47))
+    micro_fit = (
+        max(0.0, min(1.0, (micro_share - 25.0) / 50.0))
+        if micro_share is not None else 0.0
+    )
+    wallet_fit = (
+        max(0.0, min(1.0, (top_wallet_share - 25.0) / 70.0))
+        if top_wallet_share is not None else 0.0
+    )
+    top3_fit = (
+        max(0.0, min(1.0, (top3_share - 50.0) / 50.0))
+        if top3_share is not None else 0.0
+    )
+    liquidity_gap_fit = (
+        max(0.0, min(1.0, 1.0 - liquidity_to_cap / 0.03))
+        if market_cap >= 1_000_000 and liquidity_to_cap is not None else 0.0
+    )
+
+    score = round(max(0.0, min(100.0, (
+        20.0 * recent_rate_fit
+        + 10.0 * sustained_rate_fit
+        + 10.0 * buy_direction_fit
+        + 20.0 * micro_fit
+        + 25.0 * wallet_fit
+        + 5.0 * top3_fit
+        + 10.0 * liquidity_gap_fit
+    ))), 1)
+
+    flags: list[str] = []
+    micro_swarm = bool(
+        raw_trade_count is not None
+        and raw_trade_count >= settings["minimum_raw_trades"]
+        and median_buy is not None
+        and median_buy <= settings["maximum_median_buy"]
+        and micro_share is not None
+        and micro_share >= settings["minimum_micro_share"]
+    )
+    concentrated_usd = bool(
+        top_wallet_share is not None
+        and top_wallet_share >= settings["minimum_top_wallet_share"]
+    )
+    if micro_swarm:
+        flags.append("MICRO-BUY SWARM")
+    if concentrated_usd:
+        flags.append("WALLET-USD CONCENTRATION")
+    if buy_share * 100.0 >= settings["minimum_buy_share"]:
+        flags.append("BUY-SIDE IMBALANCE")
+    if market_cap >= 1_000_000 and liquidity_to_cap is not None and liquidity_to_cap < 0.03:
+        flags.append("THIN MC/LIQUIDITY")
+    if bool(raw_sample.get("raw_sample_truncated")):
+        flags.append("100+ RAW TRADES/MIN")
+
+    if raw_status != "SAMPLED":
+        signal = "AGGREGATE ONLY"
+    elif micro_swarm and concentrated_usd:
+        signal = "BOT-LIKE RISK"
+    elif score >= 70:
+        signal = "AUTOMATION-LIKE"
+    elif score >= 55:
+        signal = "BOT WATCH"
+    else:
+        signal = "LOW"
+
+    return {
+        "bot_score": score,
+        "bot_signal": signal,
+        "bot_flags": " · ".join(flags) or "No strong raw-trade flag",
+        "trades_per_minute": round(trades_per_minute, 1),
+        "sustained_trades_per_minute": round(sustained_trades_per_minute, 1),
+        "bot_buy_share_pct": round(buy_share * 100.0, 1),
+        "average_trade_usd": round(average_trade_usd, 2),
+        "median_buy_usd": median_buy,
+        "micro_buy_share_pct": micro_share,
+        "top_wallet_buy_share_pct": top_wallet_share,
+        "top3_wallet_buy_share_pct": top3_share,
+        "liquidity_to_cap_pct": (
+            round(liquidity_to_cap * 100.0, 2) if liquidity_to_cap is not None else None
+        ),
+        "bot_sample_status": raw_status,
+    }
+
+
 def verdict_badge(verdict: str) -> str:
     colors = {
         "ENTRY ELIGIBLE": "green",
@@ -351,10 +508,10 @@ if discover_tab.open:
         )
         scan_profile = st.segmented_control(
             "Ranking profile",
-            ["Early runners", "Aggressive", "Top movers", "Live now", "Risk-first"],
+            ["Early runners", "BOT trades", "Aggressive", "Top movers", "Live now", "Risk-first"],
             default="Early runners",
-            key="scan_profile_v4",
-            help="Early runners ranks young, low-cap tokens by momentum, turnover, and buy pressure.",
+            key="scan_profile_v5",
+            help="BOT trades flags automation-like activity and manipulation risk; it does not confirm wallet ownership.",
         )
         early_ungraduated_only = True
         early_settings = {
@@ -368,6 +525,19 @@ if discover_tab.open:
             "minimum_turnover": 0.12,
             "minimum_buy_ratio": 1.40,
             "minimum_trades": 25.0,
+        }
+        bot_settings = {
+            "minimum_market_cap": 5_000.0,
+            "maximum_market_cap": 150_000_000.0,
+            "minimum_age": 0.0,
+            "maximum_age": 360.0,
+            "minimum_5m_trades": 200.0,
+            "minimum_buy_share": 80.0,
+            "minimum_raw_trades": 40.0,
+            "maximum_median_buy": 0.25,
+            "minimum_micro_share": 50.0,
+            "minimum_top_wallet_share": 50.0,
+            "raw_shortlist_limit": 10.0,
         }
         with st.container(horizontal=True, vertical_alignment="bottom"):
             discovery_limit = st.select_slider(
@@ -383,12 +553,19 @@ if discover_tab.open:
                     help="Matches the pre-graduation stage of the example runner.",
                 )
                 graduated_only = False
+            elif scan_profile == "BOT trades":
+                graduated_only = st.toggle(
+                    "Graduated only",
+                    value=True,
+                    key="bot_graduated_only_v1",
+                    help="The NTDA pattern graduated immediately; turn this off to inspect pre-graduation swarms too.",
+                )
             else:
                 graduated_only = st.toggle("Graduated only", value=False)
             auto_scan_label = st.selectbox(
                 "Automatic sweep",
                 ["Off"] + [f"Every {minute} min" for minute in range(1, 16)],
-                index=1 if scan_profile == "Early runners" else 0,
+                index=1 if scan_profile in {"Early runners", "BOT trades"} else 0,
                 key=f"auto_scan_label_{scan_profile.lower().replace(' ', '_')}_v3",
                 help="Runs while the Discover view remains open.",
             )
@@ -414,7 +591,9 @@ if discover_tab.open:
                 minimum_momentum = 0.0
                 minimum_volume = 0.0
             if st.button("Sweep now", icon=":material/radar:", type="primary"):
-                st.session_state.last_auto_scan_at = time.time()
+                timestamps = dict(st.session_state.last_auto_scan_at_by_profile)
+                timestamps[scan_profile] = time.time()
+                st.session_state.last_auto_scan_at_by_profile = timestamps
                 st.cache_data.clear()
                 st.rerun()
 
@@ -486,14 +665,111 @@ if discover_tab.open:
                     "minimum_trades": float(early_minimum_trades),
                 })
 
+        if scan_profile == "BOT trades":
+            with st.expander("BOT-trade risk filters", expanded=True):
+                st.caption(
+                    "Reference pattern: NTDA · "
+                    "ufteZkSALGhT9NwE34UHNUyxinJGgAFLMmmtfZepump"
+                )
+                bot_cols = st.columns(4)
+                with bot_cols[0]:
+                    bot_minimum_market_cap = st.number_input(
+                        "Minimum market cap ($)",
+                        min_value=0.0,
+                        value=5_000.0,
+                        step=1_000.0,
+                        key="bot_minimum_market_cap_v1",
+                    )
+                    bot_minimum_5m_trades = st.number_input(
+                        "Minimum trades in 5m",
+                        min_value=0,
+                        value=200,
+                        step=25,
+                        key="bot_minimum_5m_trades_v1",
+                    )
+                    bot_minimum_raw_trades = st.number_input(
+                        "Minimum raw trades in 1m",
+                        min_value=0,
+                        value=40,
+                        step=10,
+                        key="bot_minimum_raw_trades_v1",
+                    )
+                with bot_cols[1]:
+                    bot_maximum_market_cap = st.number_input(
+                        "Maximum market cap ($)",
+                        min_value=0.0,
+                        value=150_000_000.0,
+                        step=1_000_000.0,
+                        key="bot_maximum_market_cap_v1",
+                    )
+                    bot_minimum_buy_share = st.number_input(
+                        "Minimum 5m buy share (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=80.0,
+                        step=5.0,
+                        key="bot_minimum_buy_share_v1",
+                    )
+                with bot_cols[2]:
+                    bot_age_range = st.slider(
+                        "Token-age window (minutes)",
+                        0,
+                        1_440,
+                        (0, 360),
+                        5,
+                        key="bot_age_range_v1",
+                    )
+                    bot_maximum_median_buy = st.number_input(
+                        "Maximum median buy ($)",
+                        min_value=0.0,
+                        value=0.25,
+                        step=0.05,
+                        format="%.2f",
+                        key="bot_maximum_median_buy_v1",
+                    )
+                with bot_cols[3]:
+                    bot_minimum_micro_share = st.number_input(
+                        "Minimum buys below $0.10 (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=50.0,
+                        step=5.0,
+                        key="bot_minimum_micro_share_v1",
+                    )
+                    bot_minimum_top_wallet_share = st.number_input(
+                        "Minimum top-wallet buy USD (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=50.0,
+                        step=5.0,
+                        key="bot_minimum_top_wallet_share_v1",
+                    )
+                bot_settings.update({
+                    "minimum_market_cap": float(bot_minimum_market_cap),
+                    "maximum_market_cap": float(bot_maximum_market_cap),
+                    "minimum_age": float(bot_age_range[0]),
+                    "maximum_age": float(bot_age_range[1]),
+                    "minimum_5m_trades": float(bot_minimum_5m_trades),
+                    "minimum_buy_share": float(bot_minimum_buy_share),
+                    "minimum_raw_trades": float(bot_minimum_raw_trades),
+                    "maximum_median_buy": float(bot_maximum_median_buy),
+                    "minimum_micro_share": float(bot_minimum_micro_share),
+                    "minimum_top_wallet_share": float(bot_minimum_top_wallet_share),
+                })
+
         auto_scan_minutes = 0 if auto_scan_label == "Off" else int(auto_scan_label.split()[1])
-        auto_scan_scheduler(auto_scan_minutes)
+        auto_scan_scheduler(auto_scan_minutes, scan_profile)
         if scan_profile == "Early runners":
             st.info(
                 "Early runners targets the same broad entry-stage signature: young, low-cap tokens "
                 "with strong five-minute turnover and buy pressure. A HIGH MATCH is an attention "
                 "signal, not a buy signal. Some launch-mode and audit fields are unavailable in "
                 "the quick feed, so deep-scan every candidate."
+            )
+        elif scan_profile == "BOT trades":
+            st.error(
+                "BOT trades is a manipulation-risk detector modeled on NTDA's micro-buy swarm and "
+                "wallet-dollar concentration. BOT-LIKE RISK means avoid or investigate—it is not a buy signal."
             )
         elif scan_profile == "Aggressive":
             st.warning(
@@ -515,7 +791,7 @@ if discover_tab.open:
                 else:
                     feed_sort = (
                         "last_trade_timestamp"
-                        if scan_profile in {"Early runners", "Aggressive", "Top movers"}
+                        if scan_profile in {"Early runners", "BOT trades", "Aggressive", "Top movers"}
                         else "created_timestamp"
                     )
                     coins = cached_recent_mints(discovery_limit, feed_sort)
@@ -530,6 +806,7 @@ if discover_tab.open:
             discovery_df = pd.DataFrame(discovery_rows)
             mints_scanned_count = len(discovery_df)
             missing_early_data_count = 0
+            missing_bot_data_count = 0
             if scan_profile == "Early runners":
                 early_metrics = pd.DataFrame([
                     early_runner_metrics(row, early_settings)
@@ -603,6 +880,79 @@ if discover_tab.open:
                     ascending=[False, False],
                     na_position="last",
                 )
+            elif scan_profile == "BOT trades":
+                market_cap = pd.to_numeric(
+                    discovery_df["market_cap_usd"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                age_minutes = pd.to_numeric(
+                    discovery_df["age_minutes"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                buys_5m = pd.to_numeric(
+                    discovery_df["buys_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                sells_5m = pd.to_numeric(
+                    discovery_df["sells_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                buys_1h = pd.to_numeric(
+                    discovery_df["buys_1h"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                sells_1h = pd.to_numeric(
+                    discovery_df["sells_1h"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                volume_5m = pd.to_numeric(
+                    discovery_df["volume_5m"], errors="coerce"
+                ).replace([float("inf"), float("-inf")], float("nan"))
+                trades_5m = buys_5m + sells_5m
+                trades_1h = buys_1h + sells_1h
+                buy_share_pct = buys_5m.div(trades_5m.where(trades_5m > 0)) * 100.0
+                complete = discovery_df["complete"].fillna(False).astype(bool)
+
+                bot_mask = (
+                    market_cap.between(
+                        bot_settings["minimum_market_cap"],
+                        bot_settings["maximum_market_cap"],
+                    )
+                    & age_minutes.between(
+                        bot_settings["minimum_age"],
+                        bot_settings["maximum_age"],
+                    )
+                    & (trades_5m >= bot_settings["minimum_5m_trades"])
+                    & (trades_1h >= trades_5m)
+                    & (buy_share_pct >= bot_settings["minimum_buy_share"])
+                    & volume_5m.notna()
+                )
+                if graduated_only:
+                    bot_mask &= complete
+
+                discovery_df = discovery_df[bot_mask].copy().reset_index(drop=True)
+                if not discovery_df.empty:
+                    shortlist_trades = (
+                        pd.to_numeric(discovery_df["buys_5m"], errors="coerce")
+                        + pd.to_numeric(discovery_df["sells_5m"], errors="coerce")
+                    )
+                    shortlist = discovery_df.assign(_trades_5m=shortlist_trades).sort_values(
+                        "_trades_5m", ascending=False
+                    ).head(int(bot_settings["raw_shortlist_limit"]))
+                    raw_samples = cached_bot_trade_samples(tuple(shortlist["mint"].astype(str)))
+                    bot_metrics = pd.DataFrame([
+                        bot_trade_metrics(
+                            row,
+                            bot_settings,
+                            raw_samples.get(str(row.get("mint"))),
+                        )
+                        for row in discovery_df.to_dict("records")
+                    ])
+                    for column in bot_metrics:
+                        discovery_df[column] = bot_metrics[column].to_numpy()
+                    missing_bot_data_count = int(
+                        (discovery_df["bot_sample_status"] != "SAMPLED").sum()
+                    )
+                    discovery_df = discovery_df.sort_values(
+                        ["bot_score", "trades_per_minute", "score"],
+                        ascending=[False, False, False],
+                        na_position="last",
+                    )
+                discovery_df["mover_score"] = None
             elif scan_profile in {"Aggressive", "Top movers"}:
                 discovery_df = discovery_df[
                     (discovery_df["price_change_5m"].fillna(-999.0) >= minimum_momentum)
@@ -642,6 +992,14 @@ if discover_tab.open:
                             "No tokens matched every early-runner filter in this sweep. "
                             "Widen the cap or momentum window, or lower the turnover/order-flow minimums."
                         )
+                elif scan_profile == "BOT trades":
+                    with st.container(horizontal=True):
+                        st.metric("Mints scanned", mints_scanned_count, border=True)
+                        st.metric("BOT-pattern matches", 0, border=True)
+                    st.info(
+                        "No active token matched the NTDA-like cadence in this sweep. "
+                        "The default requires at least 200 trades in five minutes and 80% buys."
+                    )
                 else:
                     st.info("No fresh mints cleared the mover thresholds. Lower the 5m move or volume minimum and sweep again.")
                 st.stop()
@@ -649,13 +1007,19 @@ if discover_tab.open:
                 rank_columns = [
                     "early_signal", "early_score", "buy_share_pct", "volume_to_cap", "trade_count"
                 ]
+            elif scan_profile == "BOT trades":
+                rank_columns = [
+                    "bot_signal", "bot_score", "bot_flags", "trades_per_minute",
+                    "sustained_trades_per_minute", "bot_buy_share_pct", "median_buy_usd",
+                    "micro_buy_share_pct", "top_wallet_buy_share_pct", "liquidity_to_cap_pct",
+                ]
             elif scan_profile in {"Aggressive", "Top movers"}:
                 rank_columns = ["mover_score"]
             else:
                 rank_columns = []
             display_columns = [
                 "symbol", "verdict", *rank_columns, "score", "market_cap_usd", "liquidity_usd",
-                "price_change_5m", "price_change_1h", "volume_5m", "volume_24h", "age", "live_viewers",
+                "price_change_5m", "price_change_1h", "volume_5m", "volume_1h", "volume_24h", "age", "live_viewers",
                 "complete", "mint",
             ]
             discovery_df["age"] = discovery_df["age_minutes"].map(age_label)
@@ -692,6 +1056,11 @@ if discover_tab.open:
                     f"{missing_early_data_count} scanned token(s) were skipped because recent "
                     "market or five-minute order-flow data was unavailable."
                 )
+            if scan_profile == "BOT trades" and missing_bot_data_count:
+                st.caption(
+                    f"{missing_bot_data_count} aggregate match(es) could not receive a fresh raw-trade "
+                    "sample. They remain labeled AGGREGATE ONLY."
+                )
 
             st.dataframe(
                 discovery_df,
@@ -714,6 +1083,27 @@ if discover_tab.open:
                         format="%.2fx",
                     ),
                     "trade_count": st.column_config.NumberColumn("Trades", format="%.0f"),
+                    "bot_signal": st.column_config.TextColumn("BOT risk"),
+                    "bot_score": st.column_config.ProgressColumn(
+                        "BOT-risk rank",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f",
+                        help="Automation-like risk rank; it is not proof that a wallet is operated by a bot.",
+                    ),
+                    "bot_flags": st.column_config.TextColumn("Raw-trade flags", width="large"),
+                    "trades_per_minute": st.column_config.NumberColumn("5m trades/min", format="%.1f"),
+                    "sustained_trades_per_minute": st.column_config.NumberColumn(
+                        "Up to 1h trades/min", format="%.1f"
+                    ),
+                    "bot_buy_share_pct": st.column_config.NumberColumn("5m buy share", format="%.1f%%"),
+                    "average_trade_usd": st.column_config.NumberColumn("Avg 5m trade", format="$%.2f"),
+                    "median_buy_usd": st.column_config.NumberColumn("Median raw buy", format="$%.4f"),
+                    "micro_buy_share_pct": st.column_config.NumberColumn("Buys under $0.10", format="%.1f%%"),
+                    "top_wallet_buy_share_pct": st.column_config.NumberColumn(
+                        "Top wallet buy USD", format="%.1f%%"
+                    ),
+                    "liquidity_to_cap_pct": st.column_config.NumberColumn("Liquidity / MC", format="%.2f%%"),
                     "mover_score": st.column_config.NumberColumn("Mover rank", format="%.1f"),
                     "score": st.column_config.ProgressColumn("Risk score", min_value=0, max_value=100),
                     "market_cap_usd": st.column_config.NumberColumn("Market cap", format="$%.0f"),
@@ -721,6 +1111,7 @@ if discover_tab.open:
                     "price_change_5m": st.column_config.NumberColumn("5m", format="%+.1f%%"),
                     "price_change_1h": st.column_config.NumberColumn("1h", format="%+.1f%%"),
                     "volume_5m": st.column_config.NumberColumn("5m volume", format="$%.0f"),
+                    "volume_1h": st.column_config.NumberColumn("1h volume", format="$%.0f"),
                     "volume_24h": st.column_config.NumberColumn("24h volume", format="$%.0f"),
                     "age": st.column_config.TextColumn("Token age"),
                     "live_viewers": st.column_config.NumberColumn(
@@ -738,6 +1129,15 @@ if discover_tab.open:
                     (
                         f"${row['symbol']} · {row['early_signal']} "
                         f"{row['early_score']:.0f}/100 · {money(row['market_cap_usd'])} "
+                        f"· {str(row['mint'])[-6:]}"
+                    ): row["mint"]
+                    for row in discovery_df.to_dict("records")
+                }
+            elif scan_profile == "BOT trades":
+                candidate_labels = {
+                    (
+                        f"${row['symbol']} · {row['bot_signal']} "
+                        f"{row['bot_score']:.0f}/100 · {money(row['market_cap_usd'])} "
                         f"· {str(row['mint'])[-6:]}"
                     ): row["mint"]
                     for row in discovery_df.to_dict("records")

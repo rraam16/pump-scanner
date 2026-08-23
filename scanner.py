@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import re
+from statistics import median
 import time
 from typing import Any
 
@@ -45,6 +46,7 @@ PUMP_DISCOVERY_BOARD = (
     "https://advanced-indexer.pump.fun/boards/{board}"
     "?tier=web&surface=WEB&platform=WEB&limit={limit}"
 )
+PUMP_SWAP_TRADES = "https://swap-api.pump.fun/v2/coins/{mint}/trades?limit={limit}"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 _LIVE_ROSTER_CACHE: dict[str, dict[str, Any]] = {}
@@ -93,9 +95,12 @@ class ScanResult:
     price_change_1h: float | None = None
     price_change_24h: float | None = None
     volume_5m: float | None = None
+    volume_1h: float | None = None
     volume_24h: float | None = None
     buys_5m: int | None = None
     sells_5m: int | None = None
+    buys_1h: int | None = None
+    sells_1h: int | None = None
     buys_24h: int | None = None
     sells_24h: int | None = None
     top10_percent: float | None = None
@@ -199,6 +204,99 @@ def _extract_int(value: Any) -> int | None:
 def _first_present(*values: Any) -> Any:
     """Return the first non-None value while preserving legitimate numeric zeroes."""
     return next((value for value in values if value is not None), None)
+
+
+def analyze_bot_trades(mint: str, limit: int = 100) -> dict[str, Any]:
+    """Summarize the latest minute of PumpSwap trades for automation-like risk signals."""
+    safe_limit = max(50, min(int(limit), 100))
+    try:
+        payload = _get_json(PUMP_SWAP_TRADES.format(mint=mint, limit=safe_limit), timeout=8)
+    except (requests.RequestException, ValueError) as exc:
+        raise ScannerError(f"Pump trade sample unavailable: {exc}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("trades"), list):
+        raise ScannerError("Pump trade sample returned an unexpected response")
+
+    parsed: list[dict[str, Any]] = []
+    for trade in payload["trades"]:
+        if not isinstance(trade, dict):
+            continue
+        try:
+            timestamp = datetime.fromisoformat(str(trade.get("timestamp")).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        amount_usd = _extract_percent(trade.get("amountUsd"))
+        if amount_usd is None:
+            continue
+        parsed.append({
+            "timestamp": timestamp,
+            "side": str(trade.get("type") or "").lower(),
+            "wallet": str(trade.get("userAddress") or "unknown"),
+            "amount_usd": max(0.0, amount_usd),
+        })
+
+    if not parsed:
+        return {"bot_data_status": "NO TRADES"}
+
+    latest = max(trade["timestamp"] for trade in parsed)
+    latest_age_seconds = max(0.0, (datetime.now(timezone.utc) - latest).total_seconds())
+    if latest_age_seconds > 120.0:
+        return {
+            "bot_data_status": "STALE",
+            "raw_latest_trade_at": latest.isoformat(),
+            "raw_latest_trade_age_seconds": round(latest_age_seconds, 1),
+        }
+    cutoff_epoch = latest.timestamp() - 60.0
+    window = [trade for trade in parsed if trade["timestamp"].timestamp() >= cutoff_epoch]
+    buys = [trade for trade in window if trade["side"] == "buy"]
+    sells = [trade for trade in window if trade["side"] == "sell"]
+    buy_sizes = [trade["amount_usd"] for trade in buys]
+    buy_volume = sum(buy_sizes)
+    wallet_volume: dict[str, float] = {}
+    for trade in buys:
+        wallet_volume[trade["wallet"]] = wallet_volume.get(trade["wallet"], 0.0) + trade["amount_usd"]
+    ranked_wallet_volume = sorted(wallet_volume.values(), reverse=True)
+
+    pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+    next_cursor = str(pagination.get("nextCursor") or "")
+    cursor_timestamp_ms = _extract_int(next_cursor.rsplit("-", 1)[-1]) if "-" in next_cursor else None
+    truncated = bool(
+        pagination.get("hasMore")
+        and cursor_timestamp_ms is not None
+        and cursor_timestamp_ms / 1000 >= cutoff_epoch
+    )
+
+    median_buy = median(buy_sizes) if buy_sizes else None
+    return {
+        "bot_data_status": "SAMPLED",
+        "raw_trade_count_1m": len(window),
+        "raw_buys_1m": len(buys),
+        "raw_sells_1m": len(sells),
+        "raw_unique_buyers_1m": len(wallet_volume),
+        "raw_buy_share_pct": round(len(buys) / len(window) * 100.0, 1) if window else None,
+        "median_buy_usd": round(median_buy, 4) if median_buy is not None else None,
+        "micro_buy_share_pct": (
+            round(sum(size < 0.10 for size in buy_sizes) / len(buy_sizes) * 100.0, 1)
+            if buy_sizes else None
+        ),
+        "top_wallet_buy_share_pct": (
+            round(ranked_wallet_volume[0] / buy_volume * 100.0, 1)
+            if buy_volume > 0 and ranked_wallet_volume else None
+        ),
+        "top3_wallet_buy_share_pct": (
+            round(sum(ranked_wallet_volume[:3]) / buy_volume * 100.0, 1)
+            if buy_volume > 0 else None
+        ),
+        "largest_to_median_buy": (
+            round(max(buy_sizes) / median_buy, 1)
+            if buy_sizes and median_buy and median_buy > 0 else None
+        ),
+        "raw_sample_truncated": truncated,
+        "raw_latest_trade_at": latest.isoformat(),
+        "raw_latest_trade_age_seconds": round(latest_age_seconds, 1),
+    }
 
 
 def _live_viewers(coin: dict[str, Any]) -> int | None:
@@ -592,6 +690,7 @@ def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
         volume = attributes.get("volume_usd") or {}
         transactions = attributes.get("transactions") or {}
         txns_5m = transactions.get("m5") or {}
+        txns_1h = transactions.get("h1") or {}
         txns_24h = transactions.get("h24") or {}
         pair_address = attributes.get("address")
         coins.append({
@@ -606,9 +705,12 @@ def _gecko_pool_coins(payload: Any) -> list[dict[str, Any]] | None:
             "price_change_1h": changes.get("h1"),
             "price_change_24h": changes.get("h24"),
             "volume_5m": volume.get("m5"),
+            "volume_1h": volume.get("h1"),
             "volume_24h": volume.get("h24"),
             "buys_5m": txns_5m.get("buys"),
             "sells_5m": txns_5m.get("sells"),
+            "buys_1h": txns_1h.get("buys"),
+            "sells_1h": txns_1h.get("sells"),
             "buys_24h": txns_24h.get("buys"),
             "sells_24h": txns_24h.get("sells"),
             "complete": dex_id == "pumpswap",
@@ -782,12 +884,19 @@ def scan_token(
         price_change_1h=_extract_percent(changes.get("h1") or coin.get("price_change_1h")),
         price_change_24h=_extract_percent(changes.get("h24") or coin.get("price_change_24h")),
         volume_5m=_extract_percent(_first_present(volume.get("m5"), coin.get("volume_5m"))),
+        volume_1h=_extract_percent(_first_present(volume.get("h1"), coin.get("volume_1h"))),
         volume_24h=_extract_percent(volume.get("h24") or coin.get("volume_24h")),
         buys_5m=_extract_int(
             _first_present((txns.get("m5") or {}).get("buys"), coin.get("buys_5m"))
         ),
         sells_5m=_extract_int(
             _first_present((txns.get("m5") or {}).get("sells"), coin.get("sells_5m"))
+        ),
+        buys_1h=_extract_int(
+            _first_present((txns.get("h1") or {}).get("buys"), coin.get("buys_1h"))
+        ),
+        sells_1h=_extract_int(
+            _first_present((txns.get("h1") or {}).get("sells"), coin.get("sells_1h"))
         ),
         buys_24h=(txns.get("h24") or {}).get("buys") or coin.get("buys_24h"),
         sells_24h=(txns.get("h24") or {}).get("sells") or coin.get("sells_24h"),
