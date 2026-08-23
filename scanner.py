@@ -53,6 +53,7 @@ _LIVE_ROSTER_TTL_SECONDS = 15.0
 _LIVE_PAGE_CACHE: dict[str, dict[str, Any]] = {}
 _LIVE_PAGE_CACHED_AT = 0.0
 _LIVE_PAGE_TTL_SECONDS = 25.0
+_LIVE_PAGE_LAST_ERROR: str | None = None
 _LIVESTREAM_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _LIVESTREAM_TTL_SECONDS = 30.0
 _LIVESTREAM_FAILURE_TTL_SECONDS = 8.0
@@ -252,7 +253,7 @@ def _flight_objects(text: str, key: str, *, lookback: int = 8_000):
 
 def _live_page_roster() -> dict[str, dict[str, Any]] | None:
     """Read Pump's same-origin live page when the frontend API rejects cloud IPs."""
-    global _LIVE_PAGE_CACHE, _LIVE_PAGE_CACHED_AT
+    global _LIVE_PAGE_CACHE, _LIVE_PAGE_CACHED_AT, _LIVE_PAGE_LAST_ERROR
 
     now = time.monotonic()
     if _LIVE_PAGE_CACHED_AT and now - _LIVE_PAGE_CACHED_AT < _LIVE_PAGE_TTL_SECONDS:
@@ -260,7 +261,9 @@ def _live_page_roster() -> dict[str, dict[str, Any]] | None:
 
     try:
         payload = _get_pump_rsc(PUMP_LIVE_PAGE_RSC, "/live")
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        _LIVE_PAGE_LAST_ERROR = f"HTTP {status}" if status else type(exc).__name__
         return (
             {mint: dict(coin) for mint, coin in _LIVE_PAGE_CACHE.items()}
             if _LIVE_PAGE_CACHE else None
@@ -285,6 +288,7 @@ def _live_page_roster() -> dict[str, dict[str, Any]] | None:
 
     # A malformed/blocked response must not erase the last known good roster.
     if not roster:
+        _LIVE_PAGE_LAST_ERROR = "unexpected response"
         return (
             {mint: dict(coin) for mint, coin in _LIVE_PAGE_CACHE.items()}
             if _LIVE_PAGE_CACHE else None
@@ -292,6 +296,7 @@ def _live_page_roster() -> dict[str, dict[str, Any]] | None:
 
     _LIVE_PAGE_CACHE = roster
     _LIVE_PAGE_CACHED_AT = now
+    _LIVE_PAGE_LAST_ERROR = None
     return {mint: dict(coin) for mint, coin in roster.items()}
 
 
@@ -694,6 +699,11 @@ def discover_live_mints(limit: int = 20) -> list[dict[str, Any]]:
         )
         live = [coin for coin in candidates if _is_live(coin)]
     if not live:
+        if _LIVE_PAGE_LAST_ERROR:
+            raise ScannerError(
+                "Pump.fun viewer feed is temporarily unavailable "
+                f"({_LIVE_PAGE_LAST_ERROR})."
+            )
         raise ScannerError("No indexed Pump.fun livestreams are active right now.")
     live.sort(
         key=lambda coin: _extract_int(
